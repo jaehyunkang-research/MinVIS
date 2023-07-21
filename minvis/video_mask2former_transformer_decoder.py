@@ -11,11 +11,12 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from detectron2.config import configurable
+from detectron2.layers import Conv2d
 
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
-from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder
+from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder, MLP
 import einops
 
 
@@ -59,6 +60,19 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
+        self.recon_embed = nn.Sequential(
+            MLP(hidden_dim, hidden_dim, hidden_dim * 4, 3),
+            nn.Linear(hidden_dim*4, 28*28*3),
+        )
+        self.recon_conv = Conv2d(
+            in_channels=3,
+            out_channels=3,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+
     def forward(self, x, mask_features, mask = None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
@@ -86,11 +100,13 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
 
         predictions_class = []
         predictions_mask = []
+        predictions_recon = []
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
+        outputs_class, outputs_mask, attn_mask, recon_query = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+        predictions_recon.append(recon_query)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -114,9 +130,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
                 output
             )
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
+            outputs_class, outputs_mask, attn_mask, recon_query = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_recon.append(recon_query)
 
         assert len(predictions_class) == self.num_layers + 1
 
@@ -127,6 +144,9 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         for i in range(len(predictions_mask)):
             predictions_mask[i] = einops.rearrange(predictions_mask[i], '(b t) q h w -> b q t h w', t=t)
 
+        for i in range(len(predictions_recon)):
+            predictions_recon[i] = einops.rearrange(predictions_recon[i], '(b t) q c h w -> b q t c h w', t=t)
+
         for i in range(len(predictions_class)):
             predictions_class[i] = einops.rearrange(predictions_class[i], '(b t) q c -> b t q c', t=t)
 
@@ -136,8 +156,9 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'pred_recons': predictions_recon[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
+                predictions_class if self.mask_classification else None, predictions_mask, predictions_recon
             ),
             'pred_embds': pred_embds,
         }
@@ -159,4 +180,23 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, attn_mask
+        recon_query = self.recon_embed(decoder_output)
+        recon_query = recon_query.reshape(-1, 28, 28, 3).permute(0, 3, 1, 2)
+        recon_query = self.recon_conv(recon_query)
+        recon_query = recon_query.reshape(*decoder_output.shape[:2], *recon_query.shape[1:])
+
+
+        return outputs_class, outputs_mask, attn_mask, recon_query.sigmoid()
+    
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_recon):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        if self.mask_classification:
+            return [
+                {"pred_logits": a, "pred_masks": b, "pred_recons": c}
+                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_recon[:-1])
+            ]
+        else:
+            return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]

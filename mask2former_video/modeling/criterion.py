@@ -184,6 +184,19 @@ class VideoSetCriterion(nn.Module):
         del src_masks
         del target_masks
         return losses
+    
+    def loss_recon(self, outputs, targets, indices, num_masks):
+        src_idx = self._get_src_permutation_idx(indices)
+        src_objects = outputs['pred_recons']
+        src_objects = src_objects[src_idx]
+
+        # objects = [t["objects"] for t in targets]
+        target_objects = torch.cat([t['objects'][i] for t, (_, i) in zip(targets, indices)]).to(src_objects)
+
+        loss_mse = F.mse_loss(src_objects, target_objects.flatten(0, 1))
+        losses = {"loss_recon": loss_mse}
+
+        return losses
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -201,6 +214,7 @@ class VideoSetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
+            'recon': self.loss_recon,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
