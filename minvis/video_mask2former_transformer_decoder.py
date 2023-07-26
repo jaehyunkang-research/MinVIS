@@ -78,7 +78,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
-                    d_model=hidden_dim*2,
+                    d_model=hidden_dim,
                     nhead=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
@@ -105,20 +105,23 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
 
             self.transformer_ffn_layers.append(
                 FFNLayer(
-                    d_model=hidden_dim*2,
+                    d_model=hidden_dim,
                     dim_feedforward=dim_feedforward,
                     dropout=0.0,
                     normalize_before=pre_norm,
                 )
             )
 
-        self.decoder_norm = nn.LayerNorm(hidden_dim*2)
+        self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.num_queries = num_queries
         # learnable query features
-        self.query_feat = nn.Embedding(num_queries, hidden_dim*2)
+        self.query_feat = nn.Embedding(num_queries, hidden_dim)
         # learnable query p.e.
-        self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+
+        self.upsample_mlp = MLP(hidden_dim, hidden_dim, hidden_dim*2, 2)
+        self.downsample_mlp = MLP(hidden_dim*2, hidden_dim, hidden_dim, 2)
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
@@ -192,25 +195,25 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
             random_idx = torch.randperm(attn_mask.shape[-1])[:attn_mask.shape[-1] // 2]
             block_mask[:, :, random_idx] = True
 
-            spatial_output, appearance_output = output.split(output.shape[-1] // 2, dim=-1)
-            spatial_embed, appearance_embed = query_embed.split(query_embed.shape[-1] // 2, dim=-1)
+            spatial_output, appearance_output = self.upsample_mlp(output).split(output.shape[-1], dim=-1)
 
             # attention: cross-attention first
             spatial_output = self.transformer_cross_attention_layers[i](
                 spatial_output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=spatial_embed
+                pos=pos[level_index], query_pos=query_embed
             )
 
             appearance_output = self.transformer_block_cross_attention_layers[i](
                  appearance_output, src[level_index],
                  memory_mask=block_mask,
                  memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                 pos=pos[level_index], query_pos=appearance_embed
+                 pos=pos[level_index], query_pos=query_embed
             )
             
             output = torch.cat([spatial_output, appearance_output], dim=-1)
+            output = self.downsample_mlp(output)
 
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
@@ -261,9 +264,8 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        spatial_output, appearance_output = decoder_output.split(decoder_output.shape[-1] // 2, dim=-1)
-        outputs_class = self.class_embed(spatial_output)
-        mask_embed = self.mask_embed(spatial_output)
+        outputs_class = self.class_embed(decoder_output)
+        mask_embed = self.mask_embed(decoder_output)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # NOTE: prediction is of higher-resolution
@@ -274,10 +276,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        recon_query = self.recon_embed(appearance_output)
+        recon_query = self.recon_embed(decoder_output)
         recon_query = recon_query.reshape(-1, 28, 28, 3).permute(0, 3, 1, 2)
         recon_query = self.recon_conv(recon_query)
-        recon_query = recon_query.reshape(*appearance_output.shape[:2], *recon_query.shape[1:])
+        recon_query = recon_query.reshape(*decoder_output.shape[:2], *recon_query.shape[1:])
 
 
         return outputs_class, outputs_mask, attn_mask, recon_query.sigmoid()
