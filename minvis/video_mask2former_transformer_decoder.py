@@ -9,6 +9,7 @@
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
+import fvcore.nn.weight_init as weight_init
 
 from detectron2.config import configurable
 from detectron2.layers import Conv2d
@@ -16,7 +17,7 @@ from detectron2.layers import Conv2d
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
-from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder, MLP
+from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import CrossAttentionLayer, FFNLayer, SelfAttentionLayer, VideoMultiScaleMaskedTransformerDecoder, MLP
 import einops
 
 
@@ -56,9 +57,85 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
             num_frames=num_frames,
         )
 
+        assert mask_classification, "Only support mask classification model"
+        self.mask_classification = mask_classification
+
+        self.num_frames = num_frames
+
+        # positional encoding
         # use 2D positional embedding
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
+        
+        # define Transformer decoder here
+        self.num_heads = nheads
+        self.num_layers = dec_layers
+        self.transformer_self_attention_layers = nn.ModuleList()
+        self.transformer_cross_attention_layers = nn.ModuleList()
+        self.transformer_block_cross_attention_layers = nn.ModuleList()
+        self.transformer_ffn_layers = nn.ModuleList()
+
+        for _ in range(self.num_layers):
+            self.transformer_self_attention_layers.append(
+                SelfAttentionLayer(
+                    d_model=hidden_dim*2,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.transformer_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.transformer_block_cross_attention_layers.append(
+                 CrossAttentionLayer(
+                     d_model=hidden_dim,
+                     nhead=nheads,
+                     dropout=0.0,
+                     normalize_before=pre_norm,
+                 )
+             )
+
+            self.transformer_ffn_layers.append(
+                FFNLayer(
+                    d_model=hidden_dim*2,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+        self.decoder_norm = nn.LayerNorm(hidden_dim*2)
+
+        self.num_queries = num_queries
+        # learnable query features
+        self.query_feat = nn.Embedding(num_queries, hidden_dim*2)
+        # learnable query p.e.
+        self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
+
+        # level embedding (we always use 3 scales)
+        self.num_feature_levels = 3
+        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
+        self.input_proj = nn.ModuleList()
+        for _ in range(self.num_feature_levels):
+            if in_channels != hidden_dim or enforce_input_project:
+                self.input_proj.append(Conv2d(in_channels, hidden_dim, kernel_size=1))
+                weight_init.c2_xavier_fill(self.input_proj[-1])
+            else:
+                self.input_proj.append(nn.Sequential())
+
+        # output FFNs
+        if self.mask_classification:
+            self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+
 
         self.recon_embed = nn.Sequential(
             MLP(hidden_dim, hidden_dim, hidden_dim * 4, 3),
@@ -111,13 +188,29 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            block_mask = torch.zeros_like(attn_mask)
+            random_idx = torch.randperm(attn_mask.shape[-1])[:attn_mask.shape[-1] // 2]
+            block_mask[:, :, random_idx] = True
+
+            spatial_output, appearance_output = output.split(output.shape[-1] // 2, dim=-1)
+            spatial_embed, appearance_embed = query_embed.split(query_embed.shape[-1] // 2, dim=-1)
+
             # attention: cross-attention first
-            output = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
+            spatial_output = self.transformer_cross_attention_layers[i](
+                spatial_output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index], query_pos=spatial_embed
             )
+
+            appearance_output = self.transformer_block_cross_attention_layers[i](
+                 appearance_output, src[level_index],
+                 memory_mask=block_mask,
+                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                 pos=pos[level_index], query_pos=appearance_embed
+            )
+            
+            output = torch.cat([spatial_output, appearance_output], dim=-1)
 
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
@@ -168,8 +261,9 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
-        mask_embed = self.mask_embed(decoder_output)
+        spatial_output, appearance_output = decoder_output.split(decoder_output.shape[-1] // 2, dim=-1)
+        outputs_class = self.class_embed(spatial_output)
+        mask_embed = self.mask_embed(spatial_output)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # NOTE: prediction is of higher-resolution
@@ -180,10 +274,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        recon_query = self.recon_embed(decoder_output)
+        recon_query = self.recon_embed(appearance_output)
         recon_query = recon_query.reshape(-1, 28, 28, 3).permute(0, 3, 1, 2)
         recon_query = self.recon_conv(recon_query)
-        recon_query = recon_query.reshape(*decoder_output.shape[:2], *recon_query.shape[1:])
+        recon_query = recon_query.reshape(*appearance_output.shape[:2], *recon_query.shape[1:])
 
 
         return outputs_class, outputs_mask, attn_mask, recon_query.sigmoid()
