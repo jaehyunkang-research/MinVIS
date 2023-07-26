@@ -272,13 +272,21 @@ class VideoMaskFormer_frame(nn.Module):
 
         return outputs, gt_instances
 
-    def match_from_embds(self, tgt_embds, cur_embds):
+    def match_from_embds(self, tgts, curs):
+        tgt_embds, tgt_recons = tgts
+        cur_embds, cur_recons = curs
 
         cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
         tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
+        cur_recons = cur_recons.flatten(1,) / cur_recons.flatten(1,).norm(dim=1)[:, None]
+        tgt_recons = tgt_recons.flatten(1,) / tgt_recons.flatten(1,).norm(dim=1)[:, None]
         cos_sim = torch.mm(cur_embds, tgt_embds.transpose(0,1))
+        cos_sim_appearance = torch.mm(cur_recons, tgt_recons.transpose(0,1))
+        # cos_sim_appearance = torch.square(cur_recons.flatten(1,) - tgt_recons.flatten(1,)[:, None]).sum(dim=2)
 
-        cost_embd = 1 - cos_sim
+        alpha = 0.5
+
+        cost_embd = (1 - cos_sim) * alpha + (1 - cos_sim_appearance) * (1 - alpha)
 
         C = 1.0 * cost_embd
         C = C.cpu()
@@ -313,7 +321,7 @@ class VideoMaskFormer_frame(nn.Module):
         out_embds.append(pred_embds[0])
 
         for i in range(1, len(pred_logits)):
-            indices = self.match_from_embds(out_embds[-1], pred_embds[i])
+            indices = self.match_from_embds((out_embds[-1], out_recons[-1]), (pred_embds[i], pred_recons[i]))
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
