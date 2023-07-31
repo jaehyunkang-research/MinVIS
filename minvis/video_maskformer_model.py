@@ -20,6 +20,7 @@ from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_se
 from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
+from detectron2.layers import ROIAlign
 
 from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
@@ -97,6 +98,9 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.num_frames = num_frames
         self.window_inference = window_inference
+
+        self.resize = ROIAlign((28, 28), 1.0, 0, aligned=True)
+
 
     @classmethod
     def from_config(cls, cfg):
@@ -190,13 +194,9 @@ class VideoMaskFormer_frame(nn.Module):
                         Each dict contains keys "id", "category_id", "isthing".
         """
         images = []
-        objects = []
         for video in batched_inputs:
             for frame in video["image"]:
                 images.append(frame.to(self.device))
-            if self.training:
-                for object in video["objects"]:
-                    objects.append(object.to(self.device))
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
@@ -208,7 +208,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         if self.training:
             # mask classification target
-            targets = self.prepare_targets(batched_inputs, images, objects)
+            targets = self.prepare_targets(batched_inputs, images)
 
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
@@ -367,25 +367,33 @@ class VideoMaskFormer_frame(nn.Module):
 
         return outputs
 
-    def prepare_targets(self, targets, images, objects):
+    def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
         gt_instances = []
-        for targets_per_video in targets:
+        for v_i, targets_per_video in enumerate(targets):
             _num_instance = len(targets_per_video["instances"][0])
             mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
             object_shape = [_num_instance, self.num_frames, 3, 28, 28]
+            gt_boxes_per_video = []
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
-            gt_objects_per_video = torch.zeros(object_shape, dtype=torch.float32, device=self.device)
 
             gt_ids_per_video = []
-            for f_i, (targets_per_frame, targets_per_object) in enumerate(zip(targets_per_video["instances"], targets_per_video["objects"])):
+            for f_i, targets_per_frame in enumerate(targets_per_video["instances"]):
                 targets_per_frame = targets_per_frame.to(self.device)
                 h, w = targets_per_frame.image_size
 
+                gt_bexes_per_frame = torch.cat([
+                    torch.full((_num_instance, 1), f_i, dtype=torch.float32, device=self.device),
+                    targets_per_frame.gt_boxes.tensor,
+                ], dim=1)
+                gt_boxes_per_video.append(gt_bexes_per_frame)
                 gt_ids_per_video.append(targets_per_frame.gt_ids[:, None])
                 gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
-                gt_objects_per_video[:, f_i] = targets_per_object
 
+            gt_boxes_per_video = torch.cat(gt_boxes_per_video, dim=0)
+            frames = images.tensor.split(self.num_frames, dim=0)[v_i]
+            resized_features = self.resize(frames, gt_boxes_per_video)
+            gt_objects_per_video = resized_features.reshape(object_shape)
 
             gt_ids_per_video = torch.cat(gt_ids_per_video, dim=1)
             valid_idx = (gt_ids_per_video != -1).any(dim=-1)

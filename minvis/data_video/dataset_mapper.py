@@ -27,7 +27,6 @@ from detectron2.data import transforms as T
 
 from .augmentation import build_augmentation
 
-import torchvision
 import torch.nn.functional as F
 
 __all__ = ["YTVISDatasetMapper", "CocoClipDatasetMapper"]
@@ -158,7 +157,6 @@ class YTVISDatasetMapper:
         self.sampling_frame_shuffle = sampling_frame_shuffle
         self.sampling_frame_ratio   = sampling_frame_ratio
         self.num_classes            = num_classes
-        self.resize = torchvision.transforms.Resize(28)
         # fmt: on
         logger = logging.getLogger(__name__)
         mode = "training" if is_train else "inference"
@@ -253,7 +251,6 @@ class YTVISDatasetMapper:
                 ids[_id] = i
 
         dataset_dict["image"] = []
-        dataset_dict["objects"]  = []
         dataset_dict["instances"] = []
         dataset_dict["file_names"] = []
         for frame_idx in selected_idx:
@@ -305,23 +302,6 @@ class YTVISDatasetMapper:
             else:
                 instances.gt_masks = BitMasks(torch.empty((0, *image_shape)))
             dataset_dict["instances"].append(instances)
-
-            imgs = []
-            for box in instances.gt_boxes.tensor:
-                box = box.to(torch.int64)
-                x0, y0, x1, y1 = box
-                cropped_img = dataset_dict["image"][-1][:, y0:y1+1, x0:x1+1]
-                try:
-                    img = self.resize(cropped_img) / 255
-                    cropped_img = F.interpolate(img.unsqueeze(0), size=28, mode='bilinear', align_corners=False).squeeze(0)
-                except:
-                    assert f"Error in resize: {cropped_img.shape}"
-                imgs.append(cropped_img)
-            if len(imgs):
-                imgs = torch.stack(imgs, dim=0)
-            else:
-                imgs = torch.empty(0, 3, 28, 28)
-            dataset_dict["objects"].append(imgs)
 
         return dataset_dict
 

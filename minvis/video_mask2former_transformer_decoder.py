@@ -186,7 +186,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         recon_query = recon_query.reshape(*decoder_output.shape[:2], *recon_query.shape[1:])
 
 
-        return outputs_class, outputs_mask, attn_mask, recon_query.sigmoid()
+        return outputs_class, outputs_mask, attn_mask, recon_query
     
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_recon):
