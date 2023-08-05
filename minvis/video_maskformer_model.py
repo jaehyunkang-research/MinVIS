@@ -264,8 +264,8 @@ class VideoMaskFormer_frame(nn.Module):
 
     def match_from_embds(self, tgt_embds, cur_embds):
 
-        cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
-        tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
+        cur_embds = cur_embds / (cur_embds.norm(dim=1)[:, None] + 1e-8)
+        tgt_embds = tgt_embds / (tgt_embds.norm(dim=1)[:, None] + 1e-8)
         cos_sim = torch.mm(cur_embds, tgt_embds.transpose(0,1))
 
         cost_embd = 1 - cos_sim
@@ -280,6 +280,7 @@ class VideoMaskFormer_frame(nn.Module):
 
     def post_processing(self, outputs):
         pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
+        mask_features = outputs["mask_features"]
 
         # pred_logits: 1 t q c
         # pred_masks: 1 q t h w
@@ -298,12 +299,20 @@ class VideoMaskFormer_frame(nn.Module):
         out_masks.append(pred_masks[0])
         out_embds.append(pred_embds[0])
 
+        prev_feature = (mask_features[0][None] * (pred_masks[0] > 0)[:, None]).sum(dim=(2, 3)) / (pred_masks[0] > 0).sum(dim=(1, 2))[:, None]
+        # handle zero division
+        prev_feature[torch.isnan(prev_feature)] = 0
+
         for i in range(1, len(pred_logits)):
-            indices = self.match_from_embds(out_embds[-1], pred_embds[i])
+            cur_feature = (mask_features[i][None] * (pred_masks[i] > 0)[:, None]).sum(dim=(2, 3)) / (pred_masks[i] > 0).sum(dim=(1, 2))[:, None]
+            # handle zero division
+            cur_feature[torch.isnan(cur_feature)] = 0
+            indices = self.match_from_embds(prev_feature, cur_feature)
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
+            prev_feature = cur_feature
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
