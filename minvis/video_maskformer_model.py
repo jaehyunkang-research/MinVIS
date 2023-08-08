@@ -20,6 +20,7 @@ from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_se
 from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
+from detectron2.layers import ROIAlign
 
 from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
@@ -97,6 +98,8 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.num_frames = num_frames
         self.window_inference = window_inference
+
+        self.roi_align = ROIAlign((7, 7), 1.0, 0, aligned=True)
 
     @classmethod
     def from_config(cls, cfg):
@@ -219,7 +222,7 @@ class VideoMaskFormer_frame(nn.Module):
                     losses.pop(k)
             return losses
         else:
-            outputs = self.post_processing(outputs)
+            outputs = self.post_processing(outputs, features["res2"])
 
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
@@ -277,7 +280,7 @@ class VideoMaskFormer_frame(nn.Module):
         cost_embd = 1 - cos_sim
         cost_appearance = 1 - cos_sim_appearance
 
-        alpha = 0.9
+        alpha = 0.0
 
         C = alpha * cost_embd + (1 - alpha) * cost_appearance
         C = C.cpu()
@@ -287,40 +290,52 @@ class VideoMaskFormer_frame(nn.Module):
 
         return indices
 
-    def post_processing(self, outputs):
+    def post_processing(self, outputs, res2_features):
         pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
-        mask_features = outputs["mask_features"]
+        mask_features = res2_features
 
         # pred_logits: 1 t q c
         # pred_masks: 1 q t h w
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
+        feature_mul = torch.einsum('tchw,tqc->tqhw',res2_features,pred_embds).flatten(2,)
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
         pred_embds = list(torch.unbind(pred_embds))
+        feature_mul = list(torch.unbind(feature_mul))
 
         out_logits = []
         out_masks = []
         out_embds = []
+        out_mul = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
         out_embds.append(pred_embds[0])
+        out_mul.append(feature_mul[0])
 
-        prev_feature = (mask_features[0][None] * (pred_masks[0].sigmoid())[:, None]).mean(dim=(2, 3))
+        boxes = BitMasks(pred_masks[0] > 0).get_bounding_boxes().tensor.to(pred_masks[0].device)
+        new_boxes = torch.cat([torch.zeros((boxes.shape[0], 1), dtype=torch.float32, device=boxes.device), boxes], dim=1)
+
+        # prev_feature = self.roi_align(mask_features[0][None], new_boxes).mean(dim=(2,3))
 
         for i in range(1, len(pred_logits)):
-            cur_feature = (mask_features[i][None] * (pred_masks[i].sigmoid())[:, None]).mean(dim=(2, 3))
+            # cur_feature = (mask_features[i][None] * (pred_masks[i].sigmoid())[:, None]).mean(dim=(2, 3))
 
-            tgts = out_embds[-1], prev_feature
-            curs = pred_embds[i], cur_feature
+            boxes = BitMasks(pred_masks[i] > 0).get_bounding_boxes().tensor.to(pred_masks[i].device)
+            new_boxes = torch.cat([torch.zeros((boxes.shape[0], 1), dtype=torch.float32, device=boxes.device), boxes], dim=1)
+            # cur_feature = self.roi_align(mask_features[i][None], new_boxes).mean(dim=(2,3))
+
+            tgts = out_embds[-1], out_mul[-1]
+            curs = pred_embds[i], feature_mul[i]
             indices = self.match_from_embds(tgts, curs)
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
-            prev_feature = cur_feature
+            out_mul.append(feature_mul[i][indices, :])
+            # prev_feature = cur_feature
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
