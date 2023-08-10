@@ -25,6 +25,8 @@ from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
 
+from .video_appearance_extractor import build_appearance_extractor
+
 from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ class VideoMaskFormer_frame(nn.Module):
         *,
         backbone: Backbone,
         sem_seg_head: nn.Module,
+        extractor: nn.Module,
         criterion: nn.Module,
         num_queries: int,
         object_mask_threshold: float,
@@ -82,6 +85,7 @@ class VideoMaskFormer_frame(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.sem_seg_head = sem_seg_head
+        self.extractor = extractor
         self.criterion = criterion
         self.num_queries = num_queries
         self.overlap_threshold = overlap_threshold
@@ -102,6 +106,7 @@ class VideoMaskFormer_frame(nn.Module):
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
+        extractor = build_appearance_extractor(cfg)
 
         # Loss parameters:
         deep_supervision = cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION
@@ -145,6 +150,7 @@ class VideoMaskFormer_frame(nn.Module):
         return {
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
+            "extractor": extractor,
             "criterion": criterion,
             "num_queries": cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES,
             "object_mask_threshold": cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD,
@@ -201,6 +207,8 @@ class VideoMaskFormer_frame(nn.Module):
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
+            appearance_embds = self.extractor(features['res2'], outputs['pred_masks'])
+            outputs['pred_appearance'] = appearance_embds
 
         if self.training:
             # mask classification target
