@@ -74,6 +74,7 @@ class CrossAttentionExtractor(nn.Module):
 
         self.feature_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim))
 
+        self.embed_head = nn.Linear(hidden_dim, hidden_dim)
         self.num_frames = num_frames
 
     @classmethod
@@ -99,11 +100,29 @@ class CrossAttentionExtractor(nn.Module):
 
         return ret
 
-    def forward(self, features: Tensor, pred_masks: Tensor):
+    def forward(self, features: Tensor, pred_masks: Tensor, targets: Tensor = None):
         pos_embed = self.pe_layer(features, None).flatten(2).permute(2, 0, 1)
         features = self.feature_proj(features).flatten(2).permute(2, 0, 1) # BT x C x H x W -> HW x BT x C
 
-        attn_mask = pred_masks.transpose(1, 2).flatten(0, 1) # B x Q x T x H x W -> BT x Q x H x W
+        if self.training:
+            masks = [F.interpolate(t['masks'], size=pred_masks.shape[-2:]).squeeze(1) for t in targets]
+            try:
+                all_masks = [torch.zeros(m.shape[-2:], device=pred_masks.device) if len(m)==0 else m.max(0)[0] for m in masks]
+            except:
+                print('hi')
+            attn_mask = []
+            mask_indices = []
+            for mask, all_mask in zip(masks, all_masks):
+                noisy_mask = ~all_mask.bool()
+                sample_mask = torch.rand(self.num_queries, *mask.shape[-2:], device=noisy_mask.device) * noisy_mask
+                sample_mask[:len(mask)] = mask
+                attn_mask.append(sample_mask)
+                mask_indices.append(torch.randperm(self.num_queries, device=noisy_mask.device))
+            mask_indices = torch.stack(mask_indices)
+            attn_mask = torch.stack(attn_mask)
+            attn_mask = torch.gather(attn_mask, 1, mask_indices[...,None,None].expand_as(attn_mask))
+        else:
+            attn_mask = pred_masks.transpose(1, 2).flatten(0, 1) # B x Q x T x H x W -> BT x Q x H x W
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
 
         _, bs, _ = features.shape
@@ -127,5 +146,43 @@ class CrossAttentionExtractor(nn.Module):
             )
 
         output = self.decoder_norm(output)
+        output = output.transpose(0, 1).reshape(-1, self.num_frames, self.num_queries, output.shape[-1])
+        output = self.embed_head(output)
 
-        return output.transpose(0, 1).reshape(-1, self.num_frames, self.num_queries, output.shape[-1])
+        loss = None
+        if self.training:
+            output = torch.gather(output, 2, mask_indices.reshape(-1, self.num_frames, self.num_queries, 1).expand_as(output))
+            loss = self.forward_cl_loss(output, targets)
+
+        return output, loss
+    
+    def forward_cl_loss(self, queries, targets):
+        '''
+        Args:
+            queries: (B, T, Q, C)
+            targets: (B, T, Q, C)
+        
+        Returns:
+            loss: (B, T, Q)
+        '''
+        B, T, _, _ = queries.shape
+        sample_idx = torch.block_diag(*torch.ones(T, self.num_queries, self.num_queries, device=queries.device))
+        contrast = torch.matmul(queries.flatten(1,2), queries.flatten(1,2).transpose(1,2)) # B x TQ x TQ
+        contrast = contrast[:, ~sample_idx.bool()].reshape(-1, T, self.num_queries, self.num_queries*(T-1)) # B x T x Q x (Q-1)
+        num_instances = []
+        contras_loss = 0
+        for bs in range(B):
+            num_instance = len(targets[bs*T]['labels'])
+            if num_instance == 0:
+                continue
+            num_instances.append(num_instance*T)
+            pos_idx = torch.eye(self.num_queries, device=queries.device)
+            pos_idx = pos_idx.repeat(1, 2).bool()
+            pos_idx[num_instance:] = 0
+            neg_idx = ~pos_idx
+            neg_idx[num_instance:] = 0
+            pos_embed = contrast[bs, :, pos_idx].reshape(T, num_instance, -1)
+            neg_embed = contrast[bs, :, neg_idx].reshape(T, num_instance, -1)
+            x = F.pad((neg_embed[:, :, None] - pos_embed[..., None]).flatten(2,), (0, 1), "constant", 0)
+            contras_loss += torch.logsumexp(x, dim=2).sum()
+        return {'loss_reid': contras_loss / sum(num_instances)}

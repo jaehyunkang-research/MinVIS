@@ -207,14 +207,16 @@ class VideoMaskFormer_frame(nn.Module):
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
-            appearance_embds = self.extractor(features['res2'], outputs['pred_masks'])
-            outputs['pred_appearance'] = appearance_embds
+            
 
         if self.training:
             # mask classification target
             targets = self.prepare_targets(batched_inputs, images)
 
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
+
+            _, loss_appearance_embds = self.extractor(features['res2'], outputs['pred_masks'], targets)
+            # outputs['pred_appearance'] = appearance_embds
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
@@ -225,6 +227,7 @@ class VideoMaskFormer_frame(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
+            losses.update(loss_appearance_embds)
             return losses
         else:
             outputs = self.post_processing(outputs)
