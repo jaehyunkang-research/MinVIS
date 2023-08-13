@@ -5,9 +5,11 @@ from torch.nn import functional as F
 from detectron2.config import configurable
 from detectron2.layers import Conv2d, get_norm
 from detectron2.utils.registry import Registry
+from detectron2.utils.comm import get_world_size
 
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
+from mask2former.utils.misc import is_dist_avail_and_initialized
 
 from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import CrossAttentionLayer, FFNLayer
 
@@ -106,10 +108,7 @@ class CrossAttentionExtractor(nn.Module):
 
         if self.training:
             masks = [F.interpolate(t['masks'], size=pred_masks.shape[-2:]).squeeze(1) for t in targets]
-            try:
-                all_masks = [torch.zeros(m.shape[-2:], device=pred_masks.device) if len(m)==0 else m.max(0)[0] for m in masks]
-            except:
-                print('hi')
+            all_masks = [torch.zeros(m.shape[-2:], device=pred_masks.device) if len(m)==0 else m.max(0)[0] for m in masks]
             attn_mask = []
             mask_indices = []
             for mask, all_mask in zip(masks, all_masks):
@@ -122,6 +121,7 @@ class CrossAttentionExtractor(nn.Module):
             attn_mask = torch.stack(attn_mask)
             attn_mask = torch.gather(attn_mask, 1, mask_indices[...,None,None].expand_as(attn_mask))
         else:
+            self.num_frames = features.shape[1]
             attn_mask = pred_masks.transpose(1, 2).flatten(0, 1) # B x Q x T x H x W -> BT x Q x H x W
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
 
@@ -152,7 +152,16 @@ class CrossAttentionExtractor(nn.Module):
         loss = None
         if self.training:
             output = torch.gather(output, 2, mask_indices.reshape(-1, self.num_frames, self.num_queries, 1).expand_as(output))
-            loss = self.forward_cl_loss(output, targets)
+            loss_reid, num_instances = self.forward_cl_loss(output, targets)
+
+            num_instances = torch.as_tensor(
+                [num_instances], dtype=torch.float, device=output.device
+            )
+            if is_dist_avail_and_initialized():
+                torch.distributed.all_reduce(num_instances)
+            num_instances = torch.clamp(num_instances / get_world_size(), min=1).item()
+
+            loss = {'loss_reid': loss_reid / num_instances}
 
         return output, loss
     
@@ -177,7 +186,7 @@ class CrossAttentionExtractor(nn.Module):
                 continue
             num_instances.append(num_instance*T)
             pos_idx = torch.eye(self.num_queries, device=queries.device)
-            pos_idx = pos_idx.repeat(1, 2).bool()
+            pos_idx = pos_idx.repeat(1, T-1).bool()
             pos_idx[num_instance:] = 0
             neg_idx = ~pos_idx
             neg_idx[num_instance:] = 0
@@ -185,4 +194,4 @@ class CrossAttentionExtractor(nn.Module):
             neg_embed = contrast[bs, :, neg_idx].reshape(T, num_instance, -1)
             x = F.pad((neg_embed[:, :, None] - pos_embed[..., None]).flatten(2,), (0, 1), "constant", 0)
             contras_loss += torch.logsumexp(x, dim=2).sum()
-        return {'loss_reid': contras_loss / sum(num_instances)}
+        return contras_loss, sum(num_instances)

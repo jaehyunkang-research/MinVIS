@@ -202,8 +202,12 @@ class VideoMaskFormer_frame(nn.Module):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
-        if not self.training and self.window_inference:
-            outputs = self.run_window_inference(images.tensor)
+        if not self.training:
+            if self.window_inference:
+                outputs = self.run_window_inference(images.tensor)
+            else:
+                appearance_embds, _ = self.extractor(features['res2'], outputs['pred_masks'])
+                outputs['pred_appearances'] = appearance_embds
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
@@ -273,13 +277,21 @@ class VideoMaskFormer_frame(nn.Module):
 
         return outputs, gt_instances
 
-    def match_from_embds(self, tgt_embds, cur_embds):
+    def match_from_embds(self, tgt, cur):
+        tgt_embds, tgt_appearances = tgt
+        cur_embds, cur_appearances = cur
 
         cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
         tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
         cos_sim = torch.mm(cur_embds, tgt_embds.transpose(0,1))
 
-        cost_embd = 1 - cos_sim
+        cur_appearances = cur_appearances / cur_appearances.norm(dim=1)[:, None]
+        tgt_appearances = tgt_appearances / tgt_appearances.norm(dim=1)[:, None]
+        cos_sim_appearance = torch.mm(cur_appearances, tgt_appearances.transpose(0,1))
+
+        alpha = 1.0
+
+        cost_embd = (1 - cos_sim) * alpha + (1 - cos_sim_appearance) * (1 - alpha)
 
         C = 1.0 * cost_embd
         C = C.cpu()
@@ -290,27 +302,34 @@ class VideoMaskFormer_frame(nn.Module):
         return indices
 
     def post_processing(self, outputs):
-        pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
+        pred_logits, pred_masks, pred_embds, pred_appearances = \
+            outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds'], outputs['pred_appearances']
 
         # pred_logits: 1 t q c
         # pred_masks: 1 q t h w
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
+        pred_appearances = pred_appearances[0]
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
         pred_embds = list(torch.unbind(pred_embds))
+        pred_appearances = list(torch.unbind(pred_appearances))
 
         out_logits = []
         out_masks = []
         out_embds = []
+        out_appearances = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
         out_embds.append(pred_embds[0])
+        out_appearances.append(pred_appearances[0])
 
         for i in range(1, len(pred_logits)):
-            indices = self.match_from_embds(out_embds[-1], pred_embds[i])
+            prev = out_embds[-1], out_appearances[-1]
+            cur = pred_embds[i], pred_appearances[i]
+            indices = self.match_from_embds(prev, cur)
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
@@ -338,6 +357,8 @@ class VideoMaskFormer_frame(nn.Module):
 
             features = self.backbone(images_tensor[start_idx:end_idx])
             out = self.sem_seg_head(features)
+            appearance_embds, _ = self.extractor(features['res2'], out['pred_masks'])
+            out['pred_appearances'] = appearance_embds
             del features['res2'], features['res3'], features['res4'], features['res5']
             for j in range(len(out['aux_outputs'])):
                 del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
@@ -348,6 +369,7 @@ class VideoMaskFormer_frame(nn.Module):
         outputs['pred_logits'] = torch.cat([x['pred_logits'] for x in out_list], dim=1).detach()
         outputs['pred_masks'] = torch.cat([x['pred_masks'] for x in out_list], dim=2).detach()
         outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=2).detach()
+        outputs['pred_appearances'] = torch.cat([x['pred_appearances'] for x in out_list], dim=1).detach()
 
         return outputs
 
