@@ -217,10 +217,9 @@ class VideoMaskFormer_frame(nn.Module):
             # mask classification target
             targets = self.prepare_targets(batched_inputs, images)
 
-            outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
-
             _, loss_appearance_embds = self.extractor(features['res2'], outputs['pred_masks'], targets)
-            # outputs['pred_appearance'] = appearance_embds
+
+            outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)

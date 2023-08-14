@@ -70,9 +70,9 @@ class CrossAttentionExtractor(nn.Module):
 
         self.num_queries = num_queries
         # learnable query features
-        self.apperance_query_feat = nn.Embedding(num_queries, hidden_dim)
+        self.apperance_query_feat = nn.Embedding(1, hidden_dim)
         # learnable query p.e.
-        self.appearance_query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.appearance_query_embed = nn.Embedding(1, hidden_dim)
 
         self.feature_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim))
 
@@ -103,67 +103,99 @@ class CrossAttentionExtractor(nn.Module):
         return ret
 
     def forward(self, features: Tensor, pred_masks: Tensor, targets: Tensor = None):
-        pos_embed = self.pe_layer(features, None).flatten(2).permute(2, 0, 1)
-        features = self.feature_proj(features).flatten(2).permute(2, 0, 1) # BT x C x H x W -> HW x BT x C
+        B = pred_masks.shape[0]
+
+        pos_embeds = torch.chunk(self.pe_layer(features, None).flatten(2).permute(2, 0, 1), B, dim=1)
+        features = torch.chunk(self.feature_proj(features).flatten(2).permute(2, 0, 1), B, dim=1) # BT x C x H x W -> HW x BT x C
 
         if self.training:
-            masks = [F.interpolate(t['masks'], size=pred_masks.shape[-2:]).squeeze(1) for t in targets]
-            all_masks = [torch.zeros(m.shape[-2:], device=pred_masks.device) if len(m)==0 else m.max(0)[0] for m in masks]
-            attn_mask = []
-            mask_indices = []
-            for mask, all_mask in zip(masks, all_masks):
-                noisy_mask = ~all_mask.bool()
-                sample_mask = torch.rand(self.num_queries, *mask.shape[-2:], device=noisy_mask.device) * noisy_mask
-                sample_mask[:len(mask)] = mask
-                attn_mask.append(sample_mask)
-                mask_indices.append(torch.randperm(self.num_queries, device=noisy_mask.device))
-            mask_indices = torch.stack(mask_indices)
-            attn_mask = torch.stack(attn_mask)
-            attn_mask = torch.gather(attn_mask, 1, mask_indices[...,None,None].expand_as(attn_mask))
+            assert self.num_frames > 2
+            pos_neg_label = torch.zeros((self.num_frames-1)*3, device=pred_masks.device)
+            pos_neg_label[:self.num_frames-1] = 1
+            pos_label = pos_neg_label == 1
+            neg_label = pos_neg_label == 0
+
+            contras_loss = 0
+            aux_cosine_loss = 0
+            all_instances = 0
+
+            for bs, target in enumerate(targets):
+                video_masks = F.interpolate(target['masks'], size=pred_masks.shape[-2:]) > 0.1
+                valid_video = video_masks[:, 0].sum((-1,-2)) != 0
+                video_masks = video_masks[valid_video]
+
+                num_instances = video_masks.shape[0]
+                if num_instances == 0:
+                    continue
+                anchor_masks = video_masks[:, :1]
+                pos_masks = video_masks[:, 1:]
+                hard_neg_masks = anchor_masks.expand_as(pos_masks) & ~pos_masks
+                soft_neg_masks = ~hard_neg_masks & ~pos_masks
+
+                attn_mask = torch.cat([anchor_masks, pos_masks, hard_neg_masks, soft_neg_masks], dim=1).transpose(0, 1)
+                attn_mask = ~(attn_mask.flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1))
+
+                feature_batch = torch.tensor([1] + [3] * (self.num_frames-1), device=video_masks.device)
+                feature = features[bs].repeat_interleave(feature_batch, dim=1)
+                pos_embed = pos_embeds[bs].repeat_interleave(feature_batch, dim=1)
+
+                query_embed = self.appearance_query_embed.weight.unsqueeze(1).repeat(num_instances, sum(feature_batch), 1)
+                output = self.apperance_query_feat.weight.unsqueeze(1).repeat(num_instances, sum(feature_batch), 1)
+
+                if len(torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])[0]):
+                    print('hi')
+                    # postive가 없거나, anchor가 없거나, negative가 없거나 등의 문제 해결 필요
+
+                for i in range(self.num_layers):
+                    output = self.transformer_cross_attention_layers[i](
+                        output, feature,
+                        memory_mask=attn_mask,
+                        memory_key_padding_mask=None,
+                        pos=pos_embed, query_pos=query_embed
+                    )
+                    
+                    # FFN
+                    output = self.transformer_ffn_layers[i](
+                        output
+                    )
+
+                output = self.decoder_norm(output)
+
+                anchor_embedding = self.embed_head(output[:, :1])
+                pos_neg_embedding = self.embed_head(output[:, 1:])
+
+                dot_product = torch.einsum('nkc,nrc->nkr', anchor_embedding, pos_neg_embedding).squeeze(1) # num of anchors (num instance) x num of pos/neg
+                aux_normalize_pos_neg_embedding = F.normalize(pos_neg_embedding, dim=-1)
+                aux_normalize_anchor_embedding = F.normalize(anchor_embedding, dim=-1)
+                aux_cosine_similarity = torch.einsum('nkc,nrc->nkr', aux_normalize_anchor_embedding, aux_normalize_pos_neg_embedding).squeeze(1)
+
+                pred_pos = dot_product * pos_label
+                pred_neg = dot_product * neg_label
+                
+                pred_pos[:, neg_label] = pred_pos[:, neg_label] + float('inf')
+                pred_neg[:, pos_label] = pred_neg[:, pos_label] + float('-inf')
+
+                _pos_expand = torch.repeat_interleave(pred_pos, dot_product.shape[1], dim=1)
+                _neg_expand = pred_neg.repeat(1, dot_product.shape[1])
+                # [bz,N], N is all pos and negative samples on reference frame, label indicate it's pos or negative
+                x = torch.nn.functional.pad(
+                    (_neg_expand - _pos_expand), (0, 1), "constant", 0)
+                try:
+                    contras_loss += torch.logsumexp(x, dim=1).sum()
+                except:
+                    print('h')
+                aux_cosine_loss += (torch.abs(aux_cosine_similarity - pos_neg_label) ** 2).mean()
+                all_instances += num_instances
+
+            loss = {
+                'loss_reid': contras_loss / all_instances,
+                'loss_aux_cosine': aux_cosine_loss / all_instances
+                }
         else:
             self.num_frames = features.shape[1]
             attn_mask = pred_masks.transpose(1, 2).flatten(0, 1) # B x Q x T x H x W -> BT x Q x H x W
-        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
 
-        _, bs, _ = features.shape
-
-        query_embed = self.appearance_query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        output = self.apperance_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
-
-        for i in range(self.num_layers):
-            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
-            # attention: cross-attention first
-            output = self.transformer_cross_attention_layers[i](
-                output, features,
-                memory_mask=attn_mask,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos_embed, query_pos=query_embed
-            )
-            
-            # FFN
-            output = self.transformer_ffn_layers[i](
-                output
-            )
-
-        output = self.decoder_norm(output)
-        output = output.transpose(0, 1).reshape(-1, self.num_frames, self.num_queries, output.shape[-1])
-        output = self.embed_head(output)
-
-        loss = None
-        if self.training:
-            output = torch.gather(output, 2, mask_indices.reshape(-1, self.num_frames, self.num_queries, 1).expand_as(output))
-            loss_reid, num_instances = self.forward_cl_loss(output, targets)
-
-            num_instances = torch.as_tensor(
-                [num_instances], dtype=torch.float, device=output.device
-            )
-            if is_dist_avail_and_initialized():
-                torch.distributed.all_reduce(num_instances)
-            num_instances = torch.clamp(num_instances / get_world_size(), min=1).item()
-
-            loss = {'loss_reid': loss_reid / num_instances}
-
-        return output, loss
+        return None, loss
     
     def forward_cl_loss(self, queries, targets):
         '''
