@@ -202,16 +202,14 @@ class VideoMaskFormer_frame(nn.Module):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
-        if not self.training:
-            if self.window_inference:
+        if not self.training and self.window_inference:
                 outputs = self.run_window_inference(images.tensor)
-            else:
-                appearance_embds, _ = self.extractor(features['res2'], outputs['pred_masks'])
-                outputs['pred_appearances'] = appearance_embds
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
-            
+            if not self.training:
+                appearance_embds, _ = self.extractor(features['res2'], einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
+                outputs['pred_appearances'] = appearance_embds
 
         if self.training:
             # mask classification target
@@ -219,7 +217,12 @@ class VideoMaskFormer_frame(nn.Module):
 
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
-            _, loss_appearance_embds = self.extractor(features['res2'], outputs['pred_masks'], targets)
+            indices = []
+            for pred_embds in outputs['pred_embds']:
+                indice = self.match_from_embds_train(pred_embds[:,0].transpose(0,1), pred_embds[:,1].transpose(0,1))
+                indices.append(indice)
+
+            _, loss_appearance_embds = self.extractor(features['res2'], outputs['pred_masks'], indices)
             # outputs['pred_appearance'] = appearance_embds
 
             # bipartite matching-based loss
@@ -276,6 +279,21 @@ class VideoMaskFormer_frame(nn.Module):
                 gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
 
         return outputs, gt_instances
+    
+    def match_from_embds_train(self, tgt_embds, cur_embds):
+        cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
+        tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
+        cos_sim = torch.mm(cur_embds.detach(), tgt_embds.detach().transpose(0,1))
+
+        cost_embd = (1 - cos_sim)
+
+        C = 1.0 * cost_embd
+        C = C.cpu()
+
+        indices = linear_sum_assignment(C.transpose(0, 1))  # target x current
+        indices = indices[1]  # permutation that makes current aligns to target
+
+        return indices
 
     def match_from_embds(self, tgt, cur):
         tgt_embds, tgt_appearances = tgt
@@ -289,7 +307,7 @@ class VideoMaskFormer_frame(nn.Module):
         tgt_appearances = tgt_appearances / tgt_appearances.norm(dim=1)[:, None]
         cos_sim_appearance = torch.mm(cur_appearances, tgt_appearances.transpose(0,1))
 
-        alpha = 1.0
+        alpha = 0.0
 
         cost_embd = (1 - cos_sim) * alpha + (1 - cos_sim_appearance) * (1 - alpha)
 
