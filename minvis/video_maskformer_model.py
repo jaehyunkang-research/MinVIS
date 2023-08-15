@@ -205,11 +205,14 @@ class VideoMaskFormer_frame(nn.Module):
         if not self.training and self.window_inference:
                 outputs = self.run_window_inference(images.tensor)
         else:
-            features = self.backbone(images.tensor[:,0])
-            flip_features = self.backbone(images.tensor[:,1])
+            if self.training:
+                features = self.backbone(images.tensor[:,0])
+                flip_features = self.backbone(images.tensor[:,1])
+            else:
+                features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
             if not self.training:
-                appearance_embds, _ = self.extractor((features['res2'], flip_features['res2']), outputs['pred_masks'])
+                appearance_embds, _ = self.extractor((features['res2'], None), outputs['pred_masks'])
                 outputs['pred_appearances'] = appearance_embds
             
 
@@ -219,13 +222,7 @@ class VideoMaskFormer_frame(nn.Module):
 
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
-            indices = []
-            for pred_embds in outputs['pred_embds']:
-                indice = self.match_from_embds_train(pred_embds[:,0].transpose(0,1), pred_embds[:,1].transpose(0,1))
-                indices.append(indice)
-
-            _, loss_appearance_embds = self.extractor(features['res2'], outputs['pred_masks'], indices)
-            # outputs['pred_appearance'] = appearance_embds
+            _, loss_appearance_embds = self.extractor((features['res2'], flip_features['res2']), outputs['pred_masks'], targets)
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
@@ -278,24 +275,10 @@ class VideoMaskFormer_frame(nn.Module):
                 labels = targets_per_video['labels']
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
-                gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
+                flip_masks = targets_per_video['flip_masks'][:, [f], :, :]
+                gt_instances.append({"labels": labels, "ids": ids, "masks": masks, "flip_masks": flip_masks})
 
         return outputs, gt_instances
-    
-    def match_from_embds_train(self, tgt_embds, cur_embds):
-        cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
-        tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
-        cos_sim = torch.mm(cur_embds.detach(), tgt_embds.detach().transpose(0,1))
-
-        cost_embd = (1 - cos_sim)
-
-        C = 1.0 * cost_embd
-        C = C.cpu()
-
-        indices = linear_sum_assignment(C.transpose(0, 1))  # target x current
-        indices = indices[1]  # permutation that makes current aligns to target
-
-        return indices
 
     def match_from_embds(self, tgt, cur):
         tgt_embds, tgt_appearances = tgt
@@ -330,7 +313,7 @@ class VideoMaskFormer_frame(nn.Module):
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
-        pred_appearances = pred_appearances[0]
+        pred_appearances = pred_appearances.transpose(0, 1)  # t q c
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
@@ -354,6 +337,7 @@ class VideoMaskFormer_frame(nn.Module):
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
+            out_appearances.append(pred_appearances[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
@@ -400,6 +384,7 @@ class VideoMaskFormer_frame(nn.Module):
             _num_instance = len(targets_per_video["instances"][0])
             mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
+            gt_flip_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
 
             gt_ids_per_video = []
             for f_i, targets_per_frame in enumerate(targets_per_video["instances"]):
@@ -408,6 +393,7 @@ class VideoMaskFormer_frame(nn.Module):
 
                 gt_ids_per_video.append(targets_per_frame.gt_ids[:, None])
                 gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
+                gt_flip_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_flip_masks.tensor
 
             gt_ids_per_video = torch.cat(gt_ids_per_video, dim=1)
             valid_idx = (gt_ids_per_video != -1).any(dim=-1)
@@ -418,6 +404,8 @@ class VideoMaskFormer_frame(nn.Module):
             gt_instances.append({"labels": gt_classes_per_video, "ids": gt_ids_per_video})
             gt_masks_per_video = gt_masks_per_video[valid_idx].float()          # N, num_frames, H, W
             gt_instances[-1].update({"masks": gt_masks_per_video})
+            gt_flip_masks_per_video = gt_flip_masks_per_video[valid_idx].float()
+            gt_instances[-1].update({"flip_masks": gt_flip_masks_per_video})
 
         return gt_instances
 

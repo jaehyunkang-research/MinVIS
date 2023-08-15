@@ -40,6 +40,7 @@ class CrossAttentionExtractor(nn.Module):
             num_frames: int,
     ):
         super().__init__()
+        self.num_queries = num_queries
         self.num_heads = nheads
         self.num_layers = dec_layers
         self.transformer_cross_attention_layers = nn.ModuleList()
@@ -83,38 +84,70 @@ class CrossAttentionExtractor(nn.Module):
         return ret
 
     def forward(self, features: Tensor, pred_masks: Tensor, targets: Tensor = None):
-        features = self.feature_proj(features) # BT x C x H x W 
+        key_features, ref_features = features
+        key_features = F.interpolate(self.feature_proj(key_features), scale_factor=0.5) # BT x C x H x W 
 
-        BT, Q, _, _, _ = pred_masks.shape
-        if not self.training:
-            self.num_frames = BT
+        roi_features = []
+        feature_batch = []
 
-        pred_masks = F.interpolate(pred_masks.squeeze(2), scale_factor=0.25).sigmoid().detach()
-        reid_fearuemap = F.interpolate(self.feature_proj(features), scale_factor=0.25)
-        roi_features = (reid_fearuemap[:, None] * pred_masks[:, :, None]).flatten(0,1)
+        temperature = 1.0
+        num_instances = 0
+
+        loss = None
+
+        if self.training:
+            ref_features = F.interpolate(self.feature_proj(ref_features), scale_factor=0.5) 
+            for bs, target in enumerate(targets):
+                anchor_masks = F.interpolate(target["masks"], scale_factor=0.125)
+                pos_masks = F.interpolate(target["flip_masks"], scale_factor=0.125)
+                hard_neg_masks = F.interpolate((target["masks"].bool() & (~target["flip_masks"].bool())).float(), scale_factor=0.125)
+
+                anchor_features = key_features[bs, None] * anchor_masks
+                pos_features = ref_features[bs, None] * pos_masks
+                hard_neg_features = ref_features[bs, None] * hard_neg_masks
+
+                roi_features.append(torch.cat([anchor_features, pos_features, hard_neg_features], dim=0))
+                feature_batch.append(roi_features[-1].shape[0])
+            roi_features = torch.cat(roi_features, dim=0)
+
+        else:
+            pred_masks = F.interpolate(pred_masks[0], scale_factor=0.5)
+            roi_features = pred_masks.unsqueeze(2) * key_features[None]
+            roi_features = roi_features.flatten(0, 1)
 
         for conv in self.reid_convs:
             roi_features = conv(roi_features)
         roi_features = F.adaptive_avg_pool2d(roi_features, 1).flatten(1)
-        roi_features = roi_features.flatten(1)
-        # for fc in self.reid_fcs:
-        #     roi_features = fc(roi_features)
-        output = self.reid_embed(roi_features).reshape(BT//self.num_frames, self.num_frames, Q, -1)
-        loss = None
+        roi_features = self.reid_embed(roi_features)
+
         if self.training:
-            # output = torch.gather(output, 2, mask_indices.reshape(-1, self.num_frames, self.num_queries, 1).expand_as(output))
-            loss_reid, num_instances = self.forward_cl_loss(output, targets)
+            roi_features_per_image = torch.split(roi_features, feature_batch, dim=0)
+            
+            contras_loss = 0
+            for roi_embds in roi_features_per_image:
+                anchor_embds, pos_embds, hard_neg_embds = torch.chunk(roi_embds, 3, dim=0)
+                if anchor_embds.shape[0] == 0:
+                    continue
+                num_instances += anchor_embds.shape[0]
 
-            # num_instances = torch.as_tensor(
-            #     [num_instances], dtype=torch.float, device=output.device
-            # )
-            # if is_dist_avail_and_initialized():
-            #     torch.distributed.all_reduce(num_instances)
-            # num_instances = torch.clamp(num_instances / get_world_size(), min=1).item()
+                pos_neg_dot = torch.einsum("nc,mc->nm", [anchor_embds, pos_embds])
+                hard_neg_dot = torch.einsum("nc,mc->nm", [anchor_embds, hard_neg_embds])
+                
+                pos_dot = pos_neg_dot.diag()
+                soft_neg_dot = pos_neg_dot[~torch.eye(anchor_embds.shape[0]).bool()].reshape(anchor_embds.shape[0], -1)
+                hard_neg_dot = hard_neg_dot.diag()[:, None]
 
-            loss = {'loss_reid': loss_reid / num_instances}
+                all_dot_product = torch.cat([soft_neg_dot, hard_neg_dot, pos_dot[:, None]], dim=1)
+                all_dot_product = (all_dot_product - pos_dot[:, None]) / temperature
+                contras_loss += torch.logsumexp(all_dot_product, dim=1).sum()
 
-        return output, loss
+                
+
+                loss = {'loss_reid': contras_loss / num_instances * 5}
+        else:
+            roi_features = roi_features.reshape(self.num_queries, -1, roi_features.shape[-1])
+
+        return roi_features, loss
     
     def forward_cl_loss(self, queries, indices):
         '''
