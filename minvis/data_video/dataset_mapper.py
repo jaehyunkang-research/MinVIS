@@ -266,7 +266,10 @@ class YTVISDatasetMapper:
             # Pytorch's dataloader is efficient on torch.Tensor due to shared-memory,
             # but not efficient on large generic data structures due to the use of pickle & mp.Queue.
             # Therefore it's important to use torch.Tensor.
-            dataset_dict["image"].append(torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))))
+            dataset_dict["image"].append(torch.stack([
+                torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))),
+                torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).flip(1)
+                ]))
 
             if (video_annos is None) or (not self.is_train):
                 continue
@@ -299,6 +302,8 @@ class YTVISDatasetMapper:
                 instances = filter_empty_instances(instances)
             else:
                 instances.gt_masks = BitMasks(torch.empty((0, *image_shape)))
+            if True:
+                instances.gt_flip_masks = BitMasks(instances.gt_masks.tensor.flip(1))
             dataset_dict["instances"].append(instances)
 
         return dataset_dict

@@ -200,17 +200,17 @@ class VideoMaskFormer_frame(nn.Module):
             for frame in video["image"]:
                 images.append(frame.to(self.device))
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(images, self.size_divisibility)
+        images = ImageList.from_tensors(images, self.size_divisibility) # BT x #sample x C x H x W
 
-        if not self.training:
-            if self.window_inference:
+        if not self.training and self.window_inference:
                 outputs = self.run_window_inference(images.tensor)
-            else:
-                appearance_embds, _ = self.extractor(features['res2'], outputs['pred_masks'])
-                outputs['pred_appearances'] = appearance_embds
         else:
-            features = self.backbone(images.tensor)
+            features = self.backbone(images.tensor[:,0])
+            flip_features = self.backbone(images.tensor[:,1])
             outputs = self.sem_seg_head(features)
+            if not self.training:
+                appearance_embds, _ = self.extractor((features['res2'], flip_features['res2']), outputs['pred_masks'])
+                outputs['pred_appearances'] = appearance_embds
             
 
         if self.training:
