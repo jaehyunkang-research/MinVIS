@@ -124,6 +124,7 @@ class CrossAttentionExtractor(nn.Module):
             roi_features_per_image = torch.split(roi_features, feature_batch, dim=0)
             
             contras_loss = 0
+            cosine_loss = 0
             for roi_embds in roi_features_per_image:
                 anchor_embds, pos_embds, hard_neg_embds = torch.chunk(roi_embds, 3, dim=0)
                 if anchor_embds.shape[0] == 0:
@@ -141,9 +142,26 @@ class CrossAttentionExtractor(nn.Module):
                 all_dot_product = (all_dot_product - pos_dot[:, None]) / temperature
                 contras_loss += torch.logsumexp(all_dot_product, dim=1).sum()
 
-                
+                anchor_embds = F.normalize(anchor_embds, dim=1)
+                pos_embds = F.normalize(pos_embds, dim=1)
+                hard_neg_embds = F.normalize(hard_neg_embds, dim=1)
 
-                loss = {'loss_reid': contras_loss / num_instances * 5}
+                pos_neg_sim = torch.einsum("nc,mc->nm", [anchor_embds, pos_embds])
+                hard_neg_sim = torch.einsum("nc,mc->nm", [anchor_embds, hard_neg_embds])
+
+                pos_sim = pos_neg_sim.diag()
+                soft_neg_sim = pos_neg_sim[~torch.eye(anchor_embds.shape[0]).bool()].reshape(anchor_embds.shape[0], -1)
+                hard_neg_sim = hard_neg_sim.diag()[:, None]
+
+                all_sim = torch.cat([soft_neg_sim, hard_neg_sim, pos_sim[:, None]], dim=1)
+                all_label = torch.zeros_like(all_sim, dtype=torch.long)
+                all_label[:, -1] = 1
+                cosine_loss += (torch.abs(all_sim - all_label)**2).sum()
+
+                loss = {
+                    'loss_reid': contras_loss / num_instances * 5,
+                    'loss_aux_cosine': cosine_loss / num_instances * 5,
+                    }
         else:
             roi_features = roi_features.reshape(self.num_queries, -1, roi_features.shape[-1])
 
