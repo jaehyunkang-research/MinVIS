@@ -26,6 +26,30 @@ def build_appearance_extractor(cfg):
     name = cfg.MODEL.APPERANCE_EXTRACTOR.NAME
     return APPERANCE_EXTRACTOR_REGISTRY.get(name)(cfg)
 
+class Memorybank(object):
+    def __init__(self, num_queries, hidden_dim, bank_size=3, tau=0.5):
+        self.bank_size = bank_size
+        self.tau = tau
+        self.num_queries = num_queries
+        self.size = 0
+
+        self.memory_bank = torch.zeros(self.bank_size, num_queries, hidden_dim).cuda()
+
+    def update(self, embeddings):
+        '''
+        Args:
+            embeddings: (Q, C)
+        '''
+        self.memory_bank = self.memory_bank.roll(1, dims=0)
+        self.memory_bank[0] = embeddings
+        self.size = min(self.size + 1, self.bank_size)
+
+    def get(self):
+        weight = self.size / torch.arange(1, self.size+1, device=self.memory_bank.device).float() + self.tau
+        temporal_embedding = (self.memory_bank[:self.size] * weight[:, None, None]).sum(0) / weight.sum()
+
+        return temporal_embedding
+
 @APPERANCE_EXTRACTOR_REGISTRY.register()
 class CrossAttentionExtractor(nn.Module):
     @configurable

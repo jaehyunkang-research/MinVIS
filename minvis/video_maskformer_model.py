@@ -25,7 +25,7 @@ from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
 
-from .video_appearance_extractor import build_appearance_extractor
+from .video_appearance_extractor import build_appearance_extractor, Memorybank
 
 from scipy.optimize import linear_sum_assignment
 
@@ -101,6 +101,8 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.num_frames = num_frames
         self.window_inference = window_inference
+
+        self.memory_bank = Memorybank(self.num_queries, 256)
 
     @classmethod
     def from_config(cls, cfg):
@@ -288,9 +290,10 @@ class VideoMaskFormer_frame(nn.Module):
         tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
         cos_sim = torch.mm(cur_embds, tgt_embds.transpose(0,1))
 
-        cur_appearances = cur_appearances / cur_appearances.norm(dim=1)[:, None]
-        tgt_appearances = tgt_appearances / tgt_appearances.norm(dim=1)[:, None]
         cos_sim_appearance = torch.mm(cur_appearances, tgt_appearances.transpose(0,1))
+        d2t_scores = cos_sim_appearance.softmax(dim=1)
+        t2d_scores = cos_sim_appearance.softmax(dim=0)
+        cos_sim_appearance = (d2t_scores + t2d_scores) / 2
 
         alpha = 0.0
 
@@ -328,9 +331,10 @@ class VideoMaskFormer_frame(nn.Module):
         out_masks.append(pred_masks[0])
         out_embds.append(pred_embds[0])
         out_appearances.append(pred_appearances[0])
+        self.memory_bank.update(out_appearances[-1])
 
         for i in range(1, len(pred_logits)):
-            prev = out_embds[-1], out_appearances[-1]
+            prev = out_embds[-1], self.memory_bank.get()
             cur = pred_embds[i], pred_appearances[i]
             indices = self.match_from_embds(prev, cur)
 
@@ -338,6 +342,7 @@ class VideoMaskFormer_frame(nn.Module):
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
             out_appearances.append(pred_appearances[i][indices, :])
+            self.memory_bank.update(out_appearances[-1])
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
