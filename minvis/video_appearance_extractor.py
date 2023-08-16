@@ -62,6 +62,7 @@ class CrossAttentionExtractor(nn.Module):
             dec_layers: int,
             pre_norm: bool,
             num_frames: int,
+            temperature: float,
     ):
         super().__init__()
         self.num_queries = num_queries
@@ -84,6 +85,8 @@ class CrossAttentionExtractor(nn.Module):
         self.feature_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim))
         self.num_frames = num_frames
 
+        self.temperature = temperature
+
     @classmethod
     def from_config(cls, cfg):
         ret = {}
@@ -104,6 +107,7 @@ class CrossAttentionExtractor(nn.Module):
         ret["dec_layers"] = 1
         ret["pre_norm"] = cfg.MODEL.MASK_FORMER.PRE_NORM
         ret["num_frames"] = cfg.INPUT.SAMPLING_FRAME_NUM
+        ret["temperature"] = cfg.MODEL.APPERANCE_EXTRACTOR.TEMP
 
         return ret
 
@@ -114,7 +118,6 @@ class CrossAttentionExtractor(nn.Module):
         roi_features = []
         feature_batch = []
 
-        temperature = 1.0
         num_instances = 0
 
         loss = None
@@ -163,7 +166,7 @@ class CrossAttentionExtractor(nn.Module):
                 hard_neg_dot = hard_neg_dot.diag()[:, None]
 
                 all_dot_product = torch.cat([soft_neg_dot, hard_neg_dot, pos_dot[:, None]], dim=1)
-                all_dot_product = (all_dot_product - pos_dot[:, None]) / temperature
+                all_dot_product = (all_dot_product - pos_dot[:, None]) / self.temperature
                 contras_loss += torch.logsumexp(all_dot_product, dim=1).sum()
 
                 anchor_embds = F.normalize(anchor_embds, dim=1)
@@ -182,10 +185,10 @@ class CrossAttentionExtractor(nn.Module):
                 all_label[:, -1] = 1
                 cosine_loss += (torch.abs(all_sim - all_label)**2).sum()
 
-                loss = {
-                    'loss_reid': contras_loss / num_instances * 5,
-                    'loss_aux_cosine': cosine_loss / num_instances * 5,
-                    }
+            loss = {
+                'loss_reid': contras_loss / num_instances,
+                'loss_aux_cosine': cosine_loss / num_instances,
+                }
         else:
             roi_features = roi_features.reshape(self.num_queries, -1, roi_features.shape[-1])
 

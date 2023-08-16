@@ -102,7 +102,10 @@ class VideoMaskFormer_frame(nn.Module):
         self.num_frames = num_frames
         self.window_inference = window_inference
 
-        self.memory_bank = Memorybank(self.num_queries, 256)
+        self.query_memory_bank = Memorybank(self.num_queries, 256)
+        self.appearance_memory_bank = Memorybank(self.num_queries, 256)
+
+        self.a = 0.9
 
     @classmethod
     def from_config(cls, cfg):
@@ -127,7 +130,8 @@ class VideoMaskFormer_frame(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight, 
+                       "loss_reid": 5.0, "loss_aux_cosine": 5.0}
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -228,6 +232,7 @@ class VideoMaskFormer_frame(nn.Module):
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
+            losses.update(loss_appearance_embds)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -235,7 +240,6 @@ class VideoMaskFormer_frame(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
-            losses.update(loss_appearance_embds)
             return losses
         else:
             outputs = self.post_processing(outputs)
@@ -290,10 +294,9 @@ class VideoMaskFormer_frame(nn.Module):
         tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
         cos_sim = torch.mm(cur_embds, tgt_embds.transpose(0,1))
 
+        cur_appearances = cur_appearances / cur_appearances.norm(dim=1)[:, None]
+        tgt_appearances = tgt_appearances / tgt_appearances.norm(dim=1)[:, None]
         cos_sim_appearance = torch.mm(cur_appearances, tgt_appearances.transpose(0,1))
-        d2t_scores = cos_sim_appearance.softmax(dim=1)
-        t2d_scores = cos_sim_appearance.softmax(dim=0)
-        cos_sim_appearance = (d2t_scores + t2d_scores) / 2
 
         alpha = 0.0
 
@@ -330,19 +333,21 @@ class VideoMaskFormer_frame(nn.Module):
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
         out_embds.append(pred_embds[0])
+        self.query_memory_bank.update(out_embds[-1])
         out_appearances.append(pred_appearances[0])
-        self.memory_bank.update(out_appearances[-1])
+        self.appearance_memory_bank.update((out_appearances[-1]))
 
         for i in range(1, len(pred_logits)):
-            prev = out_embds[-1], self.memory_bank.get()
+            prev = self.query_memory_bank.get(), self.appearance_memory_bank.get()
             cur = pred_embds[i], pred_appearances[i]
             indices = self.match_from_embds(prev, cur)
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
+            self.query_memory_bank.update(out_embds[-1])
             out_appearances.append(pred_appearances[i][indices, :])
-            self.memory_bank.update(out_appearances[-1])
+            self.appearance_memory_bank.update(out_appearances[-1])
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w

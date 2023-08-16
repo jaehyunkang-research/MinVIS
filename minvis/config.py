@@ -14,4 +14,4 @@ def add_minvis_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE = False
     cfg.MODEL.APPERANCE_EXTRACTOR = CN()
     cfg.MODEL.APPERANCE_EXTRACTOR.NAME = "CrossAttentionExtractor"
-
+    cfg.MODEL.APPERANCE_EXTRACTOR.TEMP = 1.0
