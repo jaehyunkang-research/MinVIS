@@ -21,9 +21,10 @@ from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 
-from mask2former_video.modeling.criterion import VideoSetCriterion
-from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
+
+from .criterion import AppearanceSetCriterion
+from .matcher import AppearanceHungarianMatcher
 
 from scipy.optimize import linear_sum_assignment
 
@@ -113,14 +114,15 @@ class VideoMaskFormer_frame(nn.Module):
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
 
         # building criterion
-        matcher = VideoHungarianMatcher(
+        matcher = AppearanceHungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight,
+                       "loss_reid": 1.0, "loss_aux_cos": 1.0}
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -129,9 +131,9 @@ class VideoMaskFormer_frame(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks"]
+        losses = ["labels", "masks", "reid"]
 
-        criterion = VideoSetCriterion(
+        criterion = AppearanceSetCriterion(
             sem_seg_head.num_classes,
             matcher=matcher,
             weight_dict=weight_dict,
@@ -206,7 +208,8 @@ class VideoMaskFormer_frame(nn.Module):
             # mask classification target
             targets = self.prepare_targets(batched_inputs, images)
 
-            outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
+            indices = self.match_from_embds_train(outputs)
+            outputs, targets = self.frame_decoder_loss_reshape(outputs, targets, indices)
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
@@ -236,16 +239,32 @@ class VideoMaskFormer_frame(nn.Module):
 
             return retry_if_cuda_oom(self.inference_video)(mask_cls_result, mask_pred_result, image_size, height, width, first_resize_size)
 
-    def frame_decoder_loss_reshape(self, outputs, targets):
+    def frame_decoder_loss_reshape(self, outputs, targets, indices):
         outputs['pred_masks'] = einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w')
+        outputs['pred_masks'] = torch.gather(outputs['pred_masks'], 1, indices[:, :, None, None, None].expand_as(outputs['pred_masks']))
         outputs['pred_logits'] = einops.rearrange(outputs['pred_logits'], 'b t q c -> (b t) q c')
+        outputs['pred_logits'] = torch.gather(outputs['pred_logits'], 1, indices[:, :, None].expand_as(outputs['pred_logits']))
+        outputs['pred_embds'] = einops.rearrange(outputs['pred_embds'], 'b t q c -> (b t) q c')
+        outputs['pred_embds'] = torch.gather(outputs['pred_embds'], 1, indices[:, :, None].expand_as(outputs['pred_embds']))
         if 'aux_outputs' in outputs:
             for i in range(len(outputs['aux_outputs'])):
                 outputs['aux_outputs'][i]['pred_masks'] = einops.rearrange(
                     outputs['aux_outputs'][i]['pred_masks'], 'b q t h w -> (b t) q () h w'
                 )
+                outputs['aux_outputs'][i]['pred_masks'] = torch.gather(
+                    outputs['aux_outputs'][i]['pred_masks'], 1, indices[:, :, None, None, None].expand_as(outputs['aux_outputs'][i]['pred_masks'])
+                )
                 outputs['aux_outputs'][i]['pred_logits'] = einops.rearrange(
                     outputs['aux_outputs'][i]['pred_logits'], 'b t q c -> (b t) q c'
+                )
+                outputs['aux_outputs'][i]['pred_logits'] = torch.gather(
+                    outputs['aux_outputs'][i]['pred_logits'], 1, indices[:, :, None].expand_as(outputs['aux_outputs'][i]['pred_logits'])
+                )
+                outputs['aux_outputs'][i]['pred_embds'] = einops.rearrange(
+                    outputs['aux_outputs'][i]['pred_embds'], 'b t q c -> (b t) q c'
+                )
+                outputs['aux_outputs'][i]['pred_embds'] = torch.gather(
+                    outputs['aux_outputs'][i]['pred_embds'], 1, indices[:, :, None].expand_as(outputs['aux_outputs'][i]['pred_embds'])
                 )
 
         gt_instances = []
@@ -261,6 +280,27 @@ class VideoMaskFormer_frame(nn.Module):
                 gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
 
         return outputs, gt_instances
+    
+    def match_from_embds_train(self, outputs):
+        pred_embds = outputs['pred_embds'].detach()
+        tgt_embds = pred_embds[:, 0, :] / pred_embds[:, 0, :].norm(dim=2)[:, :, None]
+        cur_embds = pred_embds[:, 1, :] / pred_embds[:, 1, :].norm(dim=2)[:, :, None]
+        cos_sim = torch.einsum('bqc, brc -> bqr', cur_embds, tgt_embds)
+
+        cost_embd = 1 - cos_sim
+
+        indices = []
+
+        for i in range(cost_embd.shape[0]):
+            C = 1.0 * cost_embd[i]
+            C = C.cpu()
+
+            indice = linear_sum_assignment(C.transpose(0, 1))
+            indices.extend([torch.as_tensor(idx, dtype=torch.int64, device=self.device) for idx in indice])
+
+        indices = torch.stack(indices, dim=0)
+
+        return indices
 
     def match_from_embds(self, tgt_embds, cur_embds):
 
@@ -285,7 +325,7 @@ class VideoMaskFormer_frame(nn.Module):
         # pred_masks: 1 q t h w
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
-        pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
+        pred_embds = pred_embds[0]
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
