@@ -13,6 +13,7 @@ import einops
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
@@ -201,8 +202,8 @@ class VideoMaskFormer_frame(nn.Module):
         if not self.training and self.window_inference:
             outputs = self.run_window_inference(images.tensor)
         else:
-            features = self.backbone(images.tensor)
-            outputs = self.sem_seg_head(features)
+            features = checkpoint(self.backbone, images.tensor, use_reentrant=False)
+            outputs = checkpoint(self.sem_seg_head, features, use_reentrant=False)
 
         if self.training:
             # mask classification target

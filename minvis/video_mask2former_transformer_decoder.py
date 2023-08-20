@@ -6,16 +6,18 @@
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from: https://github.com/facebookresearch/detr/blob/master/models/detr.py
+import fvcore.nn.weight_init as weight_init
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 
 from detectron2.config import configurable
+from detectron2.layers import Conv2d
 
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
-from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder, MLP
+from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder, MLP, CrossAttentionLayer
 import einops
 
 
@@ -59,9 +61,25 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
+        self.transformer_res2_cross_attention_layers = nn.ModuleList()
+
+        for _ in range(self.num_layers):
+            self.transformer_res2_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+        self.res2_level_embed = nn.Embedding(1, hidden_dim)
+        self.res2_input_proj = Conv2d(in_channels, hidden_dim, kernel_size=1)
+        weight_init.c2_xavier_fill(self.res2_input_proj)
+
         self.reid_embed_head = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
 
-    def forward(self, x, mask_features, mask = None):
+    def forward(self, x, res2_feature, mask_features, mask = None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -79,6 +97,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
             # flatten NxCxHxW to HWxNxC
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
+
+        res2_feature = F.interpolate(res2_feature, size=size_list[-1], mode="bilinear", align_corners=False)
+        res2_pos = self.pe_layer(res2_feature, None).flatten(2).permute(2, 0, 1)
+        res2_src = (self.res2_input_proj(res2_feature).flatten(2) + self.res2_level_embed.weight[0][None, :, None]).permute(2, 0, 1)
 
         _, bs, _ = src[0].shape
 
@@ -111,6 +133,13 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
                 output, tgt_mask=None,
                 tgt_key_padding_mask=None,
                 query_pos=query_embed
+            )
+
+            output = self.transformer_res2_cross_attention_layers[i](
+                output, res2_src,
+                memory_mask=None,
+                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                pos=res2_pos, query_pos=query_embed
             )
             
             # FFN
