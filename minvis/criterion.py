@@ -26,13 +26,15 @@ class AppearanceSetCriterion(VideoSetCriterion):
         contrass_loss = 0
         cos_loss = 0
 
-        for i in range(len(indices)//2):
+        for i in range(0, len(indices), 2):
             key_indice = indices[i][0][indices[i][1].argsort()]
             ref_indice = indices[i+1][0][indices[i+1][1].argsort()]
-            num_instances += len(key_indice) + len(ref_indice)
+            num_instance = len(key_indice) + len(ref_indice)
+            if num_instance == 0: continue
+            num_instances += num_instance
             
-            key_embds = appearance_embds[i][0][key_indice]
-            ref_embds = appearance_embds[i][1][ref_indice]
+            key_embds = appearance_embds[i//2][0][key_indice]
+            ref_embds = appearance_embds[i//2][1][ref_indice]
 
             dot_product = torch.einsum('kc, rc -> kr', key_embds, ref_embds)
             dot_product = torch.exp(dot_product)
@@ -42,7 +44,7 @@ class AppearanceSetCriterion(VideoSetCriterion):
 
             contrass_loss += tgt_loss.sum() + cur_loss.sum()
 
-            cosine_similarity = torch.einsum('kc, rc -> kr', key_embds.norm(1), ref_embds.norm(1))
+            cosine_similarity = torch.einsum('kc, rc -> kr', F.normalize(key_embds, dim=1), F.normalize(ref_embds, dim=1))
             cos_label = torch.eye(cosine_similarity.shape[0]).cuda()
 
             cos_loss += 2 * (torch.abs(cos_label - cosine_similarity)**2).sum()

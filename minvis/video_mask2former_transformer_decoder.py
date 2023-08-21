@@ -124,7 +124,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
 
         assert len(predictions_class) == self.num_layers + 1
 
-        softmax_mask = predictions_mask[-1].flatten(2,).softmax(dim=-1) # BT Q HW
+        softmax_mask = predictions_mask[-1].detach().flatten(2,).softmax(dim=-1) # BT Q HW
         appearance_feature = self.res2_proj(res2_features).flatten(2,) # BT C HW
         appearance_embds = torch.einsum('bqd, bcd -> bqc', softmax_mask, appearance_feature) # BT Q C
         appearance_embds = self.appearance_embed(appearance_embds)

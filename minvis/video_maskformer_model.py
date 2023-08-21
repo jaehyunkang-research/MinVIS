@@ -121,7 +121,8 @@ class VideoMaskFormer_frame(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight,
+                       "loss_reid": 2.0, "loss_aux_cos": 3.0}
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -279,7 +280,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         cost_appearance = 1 - cos_sim
 
-        alpha = 0.4
+        alpha = 0.0
 
         C = 1.0 * (cost_embd * alpha + cost_appearance * (1 - alpha))
         C = C.cpu()
@@ -298,7 +299,7 @@ class VideoMaskFormer_frame(nn.Module):
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
-        pred_appearances = einops.rearrange(appearance_embds[0], 'q t c -> t q c')
+        pred_appearances = einops.rearrange(appearance_embds[0], 'c t q -> t q c')
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
