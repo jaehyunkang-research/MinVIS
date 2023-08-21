@@ -11,11 +11,12 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from detectron2.config import configurable
+from detectron2.layers import Conv2d
 
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
-from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder
+from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import MLP, VideoMultiScaleMaskedTransformerDecoder
 import einops
 
 
@@ -59,7 +60,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
-    def forward(self, x, mask_features, mask = None):
+        self.res2_proj = Conv2d(in_channels, hidden_dim, kernel_size=1)
+        self.appearance_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+
+    def forward(self, x, res2_features, mask_features, mask = None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -120,6 +124,11 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
 
         assert len(predictions_class) == self.num_layers + 1
 
+        softmax_mask = predictions_mask[-1].flatten(2,).softmax(dim=-1) # BT Q HW
+        appearance_feature = self.res2_proj(res2_features).flatten(2,) # BT C HW
+        appearance_embds = torch.einsum('bqd, bcd -> bqc', softmax_mask, appearance_feature) # BT Q C
+        appearance_embds = self.appearance_embed(appearance_embds)
+
         # expand BT to B, T  
         bt = predictions_mask[-1].shape[0]
         bs = bt // self.num_frames if self.training else 1
@@ -133,6 +142,8 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         pred_embds = self.decoder_norm(output)
         pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> b c t q', t=t)
 
+        appearance_embds = einops.rearrange(appearance_embds, '(b t) q c -> b c t q', t=t)
+
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
@@ -140,7 +151,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
                 predictions_class if self.mask_classification else None, predictions_mask
             ),
             'pred_embds': pred_embds,
-            'output': output,
+            'appearance_embds': appearance_embds,
         }
         
         return out

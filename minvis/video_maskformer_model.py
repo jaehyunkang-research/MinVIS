@@ -21,9 +21,10 @@ from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 
-from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
+
+from .criterion import AppearanceSetCriterion
 
 from scipy.optimize import linear_sum_assignment
 
@@ -129,9 +130,9 @@ class VideoMaskFormer_frame(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks"]
+        losses = ["labels", "masks", "reid"]
 
-        criterion = VideoSetCriterion(
+        criterion = AppearanceSetCriterion(
             sem_seg_head.num_classes,
             matcher=matcher,
             weight_dict=weight_dict,
@@ -219,8 +220,7 @@ class VideoMaskFormer_frame(nn.Module):
                     losses.pop(k)
             return losses
         else:
-            appearance_query = torch.einsum('q t d, t c d -> q t c', outputs['pred_masks'][0].flatten(2,).softmax(dim=-1), features['res2'].flatten(2,))
-            outputs = self.post_processing(outputs, appearance_query)
+            outputs = self.post_processing(outputs)
 
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
@@ -289,15 +289,16 @@ class VideoMaskFormer_frame(nn.Module):
 
         return indices
 
-    def post_processing(self, outputs, appearance_query):
-        pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
+    def post_processing(self, outputs):
+        pred_logits, pred_masks, pred_embds, appearance_embds = \
+            outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds'], outputs['appearance_embds']
 
         # pred_logits: 1 t q c
         # pred_masks: 1 q t h w
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
-        pred_appearances = einops.rearrange(appearance_query, 'q t c -> t q c')
+        pred_appearances = einops.rearrange(appearance_embds[0], 'q t c -> t q c')
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
