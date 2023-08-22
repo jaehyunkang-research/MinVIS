@@ -131,7 +131,7 @@ class VideoMaskFormer_frame(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "reid"]
+        losses = ["labels", "masks"]#, "reid"]
 
         criterion = AppearanceSetCriterion(
             sem_seg_head.num_classes,

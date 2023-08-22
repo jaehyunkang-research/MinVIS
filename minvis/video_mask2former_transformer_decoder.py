@@ -11,7 +11,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from detectron2.config import configurable
-from detectron2.layers import Conv2d
+from detectron2.layers import Conv2d, get_norm
 
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
@@ -61,6 +61,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
         self.res2_proj = Conv2d(in_channels, hidden_dim, kernel_size=1)
+        self.appearance_norm = nn.LayerNorm(hidden_dim)
         self.appearance_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
 
     def forward(self, x, res2_features, mask_features, mask = None):
@@ -124,10 +125,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
 
         assert len(predictions_class) == self.num_layers + 1
 
-        softmax_mask = predictions_mask[-1].detach().flatten(2,).softmax(dim=-1) # BT Q HW
+        softmax_mask = predictions_mask[-1].detach().flatten(2,).sigmoid() # BT Q HW
         appearance_feature = self.res2_proj(res2_features).flatten(2,) # BT C HW
         appearance_embds = torch.einsum('bqd, bcd -> bqc', softmax_mask, appearance_feature) # BT Q C
-        appearance_embds = self.appearance_embed(appearance_embds)
+        appearance_embds = self.appearance_embed(self.appearance_norm(appearance_embds))
 
         # expand BT to B, T  
         bt = predictions_mask[-1].shape[0]

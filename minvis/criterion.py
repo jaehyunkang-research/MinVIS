@@ -65,7 +65,6 @@ class AppearanceSetCriterion(VideoSetCriterion):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'reid': self.loss_reid,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -78,12 +77,13 @@ class AppearanceSetCriterion(VideoSetCriterion):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        key_outputs = {k: v[::2] for k, v in outputs_without_aux.items()}
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_masks = sum(len(t["labels"]) for t in targets)
+        num_masks = sum(len(t["labels"]) for t in targets[::2])
         num_masks = torch.as_tensor(
             [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
         )
@@ -94,15 +94,19 @@ class AppearanceSetCriterion(VideoSetCriterion):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+            losses.update(self.get_loss(loss, key_outputs, targets[::2], indices[::2], num_masks))
+
+        reid_loss = self.loss_reid(outputs, targets, indices, num_masks)
+        losses.update(reid_loss)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                indices = self.matcher(aux_outputs, targets)
+                aux_outputs = {k: v[::2] for k, v in aux_outputs.items()}
+                indices = self.matcher(aux_outputs, targets[::2])
                 for loss in self.losses:
                     if loss in ["reid"]: continue
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
+                    l_dict = self.get_loss(loss, aux_outputs, targets[::2], indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
