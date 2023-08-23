@@ -280,7 +280,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         cost_appearance = 1 - cos_sim
 
-        alpha = 0.0
+        alpha = 1.0
 
         C = 1.0 * (cost_embd * alpha + cost_appearance * (1 - alpha))
         C = C.cpu()

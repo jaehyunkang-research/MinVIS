@@ -118,7 +118,7 @@ class MaskFormerHead(nn.Module):
     def layers(self, features, mask=None):
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
         if self.transformer_in_feature == "multi_scale_pixel_decoder":
-            predictions = self.predictor(multi_scale_features, features['res2'].detach(), mask_features, mask)
+            predictions = self.predictor(multi_scale_features, features['res4'], mask_features, mask)
         else:
             if self.transformer_in_feature == "transformer_encoder":
                 assert (

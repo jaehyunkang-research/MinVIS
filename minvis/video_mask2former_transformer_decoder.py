@@ -60,9 +60,9 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
-        self.res2_proj = Conv2d(in_channels, hidden_dim, kernel_size=1)
-        self.appearance_norm = nn.LayerNorm(hidden_dim)
-        self.appearance_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        self.res2_proj = Conv2d(in_channels*4, hidden_dim*4, kernel_size=1)
+        self.appearance_norm = nn.LayerNorm(hidden_dim*4)
+        self.appearance_embed = MLP(hidden_dim*4, hidden_dim, hidden_dim, 3)
 
     def forward(self, x, res2_features, mask_features, mask = None):
         # x is a list of multi-scale feature
@@ -125,9 +125,10 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
 
         assert len(predictions_class) == self.num_layers + 1
 
-        softmax_mask = predictions_mask[-1].detach().flatten(2,).sigmoid() # BT Q HW
+        predicted_mask = F.interpolate(predictions_mask[-1].detach(), size=res2_features.shape[-2:], mode="bilinear", align_corners=False)
+        sigmoid_mask = predicted_mask.flatten(2,).sigmoid() # BT Q HW
         appearance_feature = self.res2_proj(res2_features).flatten(2,) # BT C HW
-        appearance_embds = torch.einsum('bqd, bcd -> bqc', softmax_mask, appearance_feature) # BT Q C
+        appearance_embds = torch.einsum('bqd, bcd -> bqc', sigmoid_mask, appearance_feature) # BT Q C
         appearance_embds = self.appearance_embed(self.appearance_norm(appearance_embds))
 
         # expand BT to B, T  
