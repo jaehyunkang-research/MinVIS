@@ -25,6 +25,8 @@ from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
 
+from .appearance_decoder import AppearanceDecoder
+
 from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class VideoMaskFormer_frame(nn.Module):
         backbone: Backbone,
         sem_seg_head: nn.Module,
         criterion: nn.Module,
+        appearance_decoder: nn.Module,
         num_queries: int,
         object_mask_threshold: float,
         overlap_threshold: float,
@@ -100,6 +103,7 @@ class VideoMaskFormer_frame(nn.Module):
         self.window_inference = window_inference
 
         self.num_classes = num_classes
+        self.appearance_decoder = appearance_decoder
 
     @classmethod
     def from_config(cls, cfg):
@@ -145,10 +149,20 @@ class VideoMaskFormer_frame(nn.Module):
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
         )
 
+        appearance_decoder = AppearanceDecoder(
+            in_channels=[256],
+            hidden_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+            nheads=cfg.MODEL.MASK_FORMER.NHEADS,
+            dim_feedforward=cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
+            appearance_layers=1,
+            pre_norm=cfg.MODEL.MASK_FORMER.PRE_NORM,
+            )
+
         return {
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "criterion": criterion,
+            "appearance_decoder": appearance_decoder,
             "num_queries": cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES,
             "object_mask_threshold": cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD,
             "overlap_threshold": cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD,
@@ -205,6 +219,7 @@ class VideoMaskFormer_frame(nn.Module):
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
+            appearance_outputs = self.appearance_decoder(outputs["output"], [features["res2"]], outputs["pred_masks"])
 
         if self.training:
             # mask classification target
