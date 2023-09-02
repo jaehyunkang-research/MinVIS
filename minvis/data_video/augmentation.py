@@ -99,6 +99,8 @@ class RandomFlip(T.Augmentation):
         if self._cnt % self.clip_frame_cnt == 0:
             self.do = self._rand_range() < self.prob
             self._cnt = 0   # avoiding overflow
+        if self._cnt % 2 != 0:
+            self.do = not self.do
         self._cnt += 1
 
         h, w = image.shape[:2]
