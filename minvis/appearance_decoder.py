@@ -75,15 +75,20 @@ class AppearanceDecoder(nn.Module):
             else:
                 self.input_proj.append(nn.Sequential())
 
-        self.appearance_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        self.appearance_norm = nn.LayerNorm(hidden_dim)
+        
+        self.appearance_projection = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        self.appearance_prediction = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
-    def forward(self, output, appearance_features, output_mask=None):
+        self.criterion = nn.CosineSimilarity(dim=-1)
+
+    def forward(self, output, appearance_features, output_mask, indices=None):
         assert len(appearance_features) == self.num_feature_levels
         src = []
         pos = []
         attn_mask = []
 
-        output_mask = output_mask.transpose(1,2).flatten(0,1) # B Q T H W -> BT Q H W
+        output_mask = output_mask.squeeze(2) 
         
         for i in range(self.num_feature_levels):
             pos.append(self.pe_layer(appearance_features[i], None).flatten(2))
@@ -117,7 +122,33 @@ class AppearanceDecoder(nn.Module):
                 output
             )
 
-        output = self.appearance_embed(output)
+        output_z = self.appearance_projection(self.appearance_norm(output))
+        output_p = self.appearance_prediction(output_z)
 
-        return output
+        if self.training:
+            loss = self.loss(output_z, output_p, indices)
+            return {"loss_appearance": loss * 5}
+            
+        return output_z
+    
+    def loss(self, z, p, indices):
+        T = 2 # only use two frames
+        B = len(indices) // T
+        idx0, idx1 = self._get_permutation_idx(indices)
 
+        z0, z1 = z.transpose(0,1).reshape(B, T, -1, z.shape[-1]).unbind(1)
+        p0, p1 = p.transpose(0,1).reshape(B, T, -1, p.shape[-1]).unbind(1)
+        z0, z1 = z0[idx0].detach(), z1[idx1].detach()
+        p0, p1 = p0[idx0], p1[idx1]
+
+        loss = -(self.criterion(p0, z1).mean() + self.criterion(p1, z0).mean()) * 0.5
+        return loss
+
+    def _get_permutation_idx(self, indices):
+        # permute targets following indices
+        sorted_idx = [src[tgt.argsort()] for src, tgt in indices]
+        batch_idx0 = torch.cat([torch.full_like(src, i) for i, src in enumerate(sorted_idx[::2])])
+        src_idx0 = torch.cat([src for src in sorted_idx[::2]])
+        batch_idx1 = torch.cat([torch.full_like(src, i) for i, src in enumerate(sorted_idx[1::2])])
+        src_idx1 = torch.cat([src for src in sorted_idx[1::2]])
+        return (batch_idx0, src_idx0), (batch_idx1, src_idx1)

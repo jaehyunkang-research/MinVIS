@@ -54,6 +54,7 @@ class VideoMaskFormer_frame(nn.Module):
         sem_seg_postprocess_before_inference: bool,
         pixel_mean: Tuple[float],
         pixel_std: Tuple[float],
+        freeze_detector: bool,
         # video
         num_frames,
         window_inference,
@@ -103,6 +104,13 @@ class VideoMaskFormer_frame(nn.Module):
         self.window_inference = window_inference
 
         self.num_classes = num_classes
+        if freeze_detector:
+            for name, p in self.named_parameters():
+                if not "appearance_decoder" in name:
+                    p.requires_grad_(False)
+
+        self.freeze_detector = freeze_detector
+
         self.appearance_decoder = appearance_decoder
 
     @classmethod
@@ -171,6 +179,7 @@ class VideoMaskFormer_frame(nn.Module):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
+            "freeze_detector": True,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,
@@ -219,7 +228,6 @@ class VideoMaskFormer_frame(nn.Module):
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
-            appearance_outputs = self.appearance_decoder(outputs["output"], [features["res2"]], outputs["pred_masks"])
 
         if self.training:
             # mask classification target
@@ -228,7 +236,10 @@ class VideoMaskFormer_frame(nn.Module):
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
             # bipartite matching-based loss
-            losses = self.criterion(outputs, targets)
+            losses, indices = self.criterion(outputs, targets)
+            
+            if self.freeze_detector:
+                losses = dict()
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -236,9 +247,14 @@ class VideoMaskFormer_frame(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
+
+            appearance_loss = self.appearance_decoder(outputs['output'], [features['res2'].detach()], outputs['pred_masks'], indices)
+            losses.update(appearance_loss)
+                    
             return losses
         else:
-            outputs = self.post_processing(outputs)
+            appearance_embds = self.appearance_decoder(outputs['output'], [features['res2'].detach()], einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
+            outputs = self.post_processing(outputs, appearance_embds)
 
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
@@ -300,7 +316,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         return indices
 
-    def post_processing(self, outputs):
+    def post_processing(self, outputs, appearance_embds):
         pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
 
         # pred_logits: 1 t q c
@@ -308,24 +324,30 @@ class VideoMaskFormer_frame(nn.Module):
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
+        appearance_embds = einops.rearrange(appearance_embds, 'q t c -> t q c')
 
         pred_logits = list(torch.unbind(pred_logits))
         pred_masks = list(torch.unbind(pred_masks))
         pred_embds = list(torch.unbind(pred_embds))
+        appearance_embds = list(torch.unbind(appearance_embds))
 
         out_logits = []
         out_masks = []
         out_embds = []
+        out_appearance_embds = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
         out_embds.append(pred_embds[0])
+        out_appearance_embds.append(appearance_embds[0])
 
         for i in range(1, len(pred_logits)):
-            indices = self.match_from_embds(out_embds[-1], pred_embds[i])
+            # indices = self.match_from_embds(out_embds[-1], pred_embds[i])
+            indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
+            out_appearance_embds.append(appearance_embds[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
