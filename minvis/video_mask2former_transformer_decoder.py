@@ -15,7 +15,7 @@ from detectron2.config import configurable
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
-from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder
+from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import VideoMultiScaleMaskedTransformerDecoder, MLP
 import einops
 
 
@@ -59,7 +59,12 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
-    def forward(self, x, mask_features, mask = None):
+        self.appearance_embed_layers = nn.ModuleList()
+        dims = [2048, 1024, 512]
+        for i in range(self.num_feature_levels):
+            self.appearance_embed_layers.append(MLP(dims[i], hidden_dim, hidden_dim, 2))
+
+    def forward(self, x, mask_features, features, mask = None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -88,13 +93,14 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         predictions_mask = []
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
+        outputs_class, outputs_mask, appearance_embed, attn_mask = self.forward_prediction_heads(output, mask_features, features[0], attn_mask_target_size=size_list[0])
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            output = output + self.appearance_embed_layers[level_index](appearance_embed)
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
@@ -114,7 +120,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
                 output
             )
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
+            outputs_class, outputs_mask, appearance_embed, attn_mask = self.forward_prediction_heads(output, mask_features, features[(i + 1) % self.num_feature_levels], attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
@@ -144,7 +150,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         
         return out
 
-    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
+    def forward_prediction_heads(self, output, mask_features, features, attn_mask_target_size):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
@@ -154,9 +160,12 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
         attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
+
+        appearance_embed = torch.einsum("bqd,bcd->bqc", attn_mask.detach().flatten(2).sigmoid(), features.flatten(2)).transpose(0,1)
+
         # must use bool type
         # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, attn_mask
+        return outputs_class, outputs_mask, appearance_embed, attn_mask
