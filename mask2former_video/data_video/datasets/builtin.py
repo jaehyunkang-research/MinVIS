@@ -13,8 +13,8 @@ from .ytvis import (
 _PREDEFINED_SPLITS_YTVIS_2019 = {
     "ytvis_2019_train": ("ytvis_2019/train/JPEGImages",
                          "ytvis_2019/train.json"),
-    "ytvis_2019_val": ("ytvis_2019/valid/JPEGImages",
-                       "ytvis_2019/valid.json"),
+    "ytvis_2019_val": ("pseudo_v8",
+                       "pseudo_v8/annotations_yt.json"),
     "ytvis_2019_test": ("ytvis_2019/test/JPEGImages",
                         "ytvis_2019/test.json"),
 }

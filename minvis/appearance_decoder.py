@@ -11,6 +11,24 @@ from mask2former.modeling.transformer_decoder.mask2former_transformer_decoder im
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 import einops
 
+@torch.no_grad()
+def concat_all_gather(tensor):
+    """
+    Performs all_gather operation on the provided tensors.
+    *** Warning ***: torch.distributed.all_gather has no gradient.
+    """
+    indices = torch.full_like(tensor, torch.distributed.get_rank())
+    indices_gather = [torch.zeros(1, dtype=torch.long, device=tensor.device)
+        for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(indices_gather, torch.as_tensor(tensor.shape[0], device=tensor.device), async_op=False)
+    indices = torch.cat(indices_gather, dim=0)
+
+    tensors_gather = [torch.ones(indices[i], tensor.shape[-1], device=tensor.device)
+        for i in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+    output = torch.cat(tensors_gather, dim=0)
+
+    return output, indices
 class AppearanceDecoder(nn.Module):
 
     def __init__(
@@ -141,8 +159,22 @@ class AppearanceDecoder(nn.Module):
         z0, z1 = z0[idx0].detach(), z1[idx1].detach()
         p0, p1 = p0[idx0], p1[idx1]
 
-        loss = -(self.criterion(p0, z1).mean() + self.criterion(p1, z0).mean()) * 0.5
+        with torch.cuda.amp.autocast(True):
+            loss = self.contrastive_loss(p0, z1) + self.contrastive_loss(p1, z0)
         return loss
+    
+    def contrastive_loss(self, q, k):
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        k, idx = concat_all_gather(k)
+        idx = torch.cumsum(idx, 0)
+
+        logits = torch.einsum('nc,mc->nm', [q, k]) / 0.07
+        N = logits.size(0)
+        # labels = (torch.arange(N, dtype=torch.long) + N * torch.distributed.get_rank()).cuda()
+        labels = torch.arange(idx[torch.distributed.get_rank()] - N, idx[torch.distributed.get_rank()], dtype=torch.long).cuda()
+        return nn.CrossEntropyLoss()(logits, labels) * (2 * 0.07)
 
     def _get_permutation_idx(self, indices):
         # permute targets following indices
