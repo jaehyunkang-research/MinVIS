@@ -158,7 +158,7 @@ class VideoMaskFormer_frame(nn.Module):
         )
 
         appearance_decoder = AppearanceDecoder(
-            in_channels=[256],
+            in_channels=[256, 512, 1024],
             hidden_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
             nheads=cfg.MODEL.MASK_FORMER.NHEADS,
             dim_feedforward=cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
@@ -248,12 +248,14 @@ class VideoMaskFormer_frame(nn.Module):
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
 
-            appearance_loss = self.appearance_decoder(outputs['output'], [features['res2'].detach()], outputs['pred_masks'], indices)
+            appearance_features = [f.detach() for f in features.values()][:3]
+            appearance_loss = self.appearance_decoder(outputs['output'], appearance_features, outputs['pred_masks'], indices)
             losses.update(appearance_loss)
                     
             return losses
         else:
-            appearance_embds = self.appearance_decoder(outputs['output'], [features['res2'].detach()], einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
+            appearance_features = [f.detach() for f in features.values()][:3]
+            appearance_embds = self.appearance_decoder(outputs['output'], appearance_features, einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
             outputs = self.post_processing(outputs, appearance_embds)
 
             mask_cls_results = outputs["pred_logits"]
