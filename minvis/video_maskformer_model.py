@@ -25,34 +25,11 @@ from mask2former_video.modeling.criterion import VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
 
+from .memory_network import MemoryNetwork
+
 from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
-
-class Memorybank(object):
-    def __init__(self, num_queries, hidden_dim, bank_size=3, tau=0.5):
-        self.bank_size = bank_size
-        self.tau = tau
-        self.num_queries = num_queries
-        self.size = 0
-
-        self.memory_bank = torch.zeros(self.bank_size, num_queries, hidden_dim).cuda()
-
-    def update(self, embeddings):
-        '''
-        Args:
-            embeddings: (Q, C)
-        '''
-        self.memory_bank = self.memory_bank.roll(1, dims=0)
-        self.memory_bank[0] = embeddings
-        self.size = min(self.size + 1, self.bank_size)
-
-    def get(self):
-        weight = self.size / torch.arange(1, self.size+1, device=self.memory_bank.device).float() + self.tau
-        temporal_embedding = (self.memory_bank[:self.size] * weight[:, None, None]).sum(0) / weight.sum()
-
-        return temporal_embedding
-
 
 @META_ARCH_REGISTRY.register()
 class VideoMaskFormer_frame(nn.Module):
@@ -79,6 +56,7 @@ class VideoMaskFormer_frame(nn.Module):
         num_frames,
         window_inference,
         num_classes,
+        freeze_detector,
     ):
         """
         Args:
@@ -123,10 +101,15 @@ class VideoMaskFormer_frame(nn.Module):
         self.num_frames = num_frames
         self.window_inference = window_inference
 
-        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
-        self.appearance_memory_bank = Memorybank(num_queries, hidden_dim=1024, bank_size=3, tau=0.5)
+        self.memory_network = MemoryNetwork(256, 1024)
 
         self.num_classes = num_classes
+
+        self.freeze_detector = freeze_detector
+        if freeze_detector:
+            for name, p in self.named_parameters():
+                if not "memory_network" in name:
+                    p.requires_grad_(False)
 
     @classmethod
     def from_config(cls, cfg):
@@ -188,6 +171,7 @@ class VideoMaskFormer_frame(nn.Module):
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,
             "num_classes": cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
+            "freeze_detector": True,
         }
 
     @property
@@ -241,14 +225,31 @@ class VideoMaskFormer_frame(nn.Module):
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
             # bipartite matching-based loss
-            losses = self.criterion(outputs, targets)
+            losses, indices = self.criterion(outputs, targets)
 
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+            memory_indices, memory_label = self.prepare_memory_targets(outputs, res_features, targets, indices)
+
+            pred_embds = torch.unbind(outputs['pred_embds'])
+            appearance_query = torch.unbind(outputs['appearance_query'])
+
+            if self.freeze_detector:
+                losses = dict()
+
+            self.memory_network.init_network(pred_embds[0], appearance_query[0])
+            for t in range(1, len(pred_embds)):
+                similarity = self.memory_network.get(pred_embds[t], appearance_query[t])
+                memory_loss = self.memory_network.loss(similarity, memory_label[t-1])
+                update_query = torch.gather(pred_embds[t], 1, memory_indices[t-1].unsqueeze(2).expand(-1, -1, pred_embds[t].shape[-1]).cuda())
+                update_appearance = torch.gather(appearance_query[t], 1, memory_indices[t-1].unsqueeze(2).expand(-1, -1, appearance_query[t].shape[-1]).cuda())
+                self.memory_network.update(update_query, update_appearance)
+                losses.update({f'memory_loss_{t}': memory_loss})
+
+            # for k in list(losses.keys()):
+            #     if k in self.criterion.weight_dict:
+            #         losses[k] *= self.criterion.weight_dict[k]
+            #     else:
+            #         # remove this loss if not specified in `weight_dict`
+            #         losses.pop(k)
             return losses
         else:
             resize_mask = F.interpolate(outputs['pred_masks'][0], size=res_features.shape[-2:])
@@ -298,32 +299,46 @@ class VideoMaskFormer_frame(nn.Module):
                 gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
 
         return outputs, gt_instances
+    
+    def prepare_memory_targets(self, outputs, features, targets, indices):
+        outputs['pred_embds'] = einops.rearrange(outputs['pred_embds'], 'b c t q -> t b q c')
+        T, B, Q, _ = outputs['pred_embds'].shape
+        memory_label = torch.zeros(T-1, B, Q, Q, dtype=torch.long, device=self.device)
 
-    def match_from_embds(self, tgts, curs, objectness):
-        cur_embds, cur_appearances = curs # 1 10 68
-        tgt_embds, tgt_appearances = tgts # 91 10 19
+        pred_masks = F.interpolate(outputs['pred_masks'].squeeze(2), size=features.shape[-2:]).flatten(2,).softmax(dim=-1)
+        appearance_query = torch.einsum('b q d, b c d -> b q c', pred_masks, features.flatten(2,))
+        outputs['appearance_query'] = einops.rearrange(appearance_query, '(b t) q d -> t b q d', t=T)
 
-        cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
-        tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
-        cos_sim = torch.mm(cur_embds, tgt_embds.transpose(0,1))
+        batch_indices = []
+        for b in range(B):
+            batch_indices.append([])
+            for t in range(T):
+                tgt_indice = indices[b*T+t]
+                sorted_indices = tgt_indice[0][tgt_indice[1].argsort()]
+                batch_indices[-1].append(sorted_indices)
 
-        cost_embd = 1 - cos_sim
+        batch_memory_indices = torch.full((T-1, B, Q), -1, dtype=torch.long)
+        for b in range(B):
+            for t in range(1, T):
+                prev_embds = outputs['pred_embds'][t-1, b]
+                cur_embds = outputs['pred_embds'][t, b]
 
-        cur_appearances = cur_appearances / cur_appearances.norm(dim=1)[:, None]
-        tgt_appearances = tgt_appearances / tgt_appearances.norm(dim=1)[:, None]
-        cos_sim = torch.mm(cur_appearances, tgt_appearances.transpose(0,1))
+                prev_embds = prev_embds / prev_embds.norm(dim=1)[:, None]
+                cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
+                cos_sim = torch.mm(prev_embds, cur_embds.transpose(0,1))
+                C = 1.0 - cos_sim
+                C[batch_indices[b][t-1]] = 1e+4
+                C[:, batch_indices[b][t]] = 1e+4
 
-        cost_appearance = 1 - cos_sim
+                memory_indices = linear_sum_assignment(C.detach().cpu())[1]
+                memory_indices = torch.tensor(memory_indices)
+                memory_indices[batch_indices[b][t-1]] = batch_indices[b][t]
+                batch_memory_indices[t-1, b] = memory_indices
 
-        alpha = (1 - objectness)[:, None]
+                cur_valid = (targets[b*T+t]['ids'] != -1).squeeze(1).cpu()
+                memory_label[t-1, b, batch_indices[b][t-1][cur_valid], batch_indices[b][t][cur_valid]] = 1
 
-        C = 1.0 * (cost_embd + cost_appearance * alpha)
-        C = C.cpu()
-
-        indices = linear_sum_assignment(C.transpose(0, 1))  # target x current
-        indices = indices[1]  # permutation that makes current aligns to target
-
-        return indices
+        return batch_memory_indices, memory_label
 
     def post_processing(self, outputs, appearance_query):
         pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
@@ -344,19 +359,14 @@ class VideoMaskFormer_frame(nn.Module):
         out_masks = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
-        self.memory_bank.update(pred_embds[0])
-        self.appearance_memory_bank.update(pred_appearances[0])
+        self.memory_network.init_network(pred_embds[0][None], pred_appearances[0][None])
 
         for i in range(1, len(pred_logits)):
-            tgts = self.memory_bank.get(), self.appearance_memory_bank.get()
-            curs = pred_embds[i], pred_appearances[i]
-
-            indices = self.match_from_embds(tgts, curs, pred_logits[i].softmax(-1)[:, -1])
-
+            similarity = self.memory_network.get(pred_embds[i][None], pred_appearances[i][None]).sigmoid()
+            indices = linear_sum_assignment(similarity[0].detach().cpu(), maximize=True)[1]
+            self.memory_network.update(pred_embds[i][indices][None], pred_appearances[i][indices][None])
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
-            self.memory_bank.update(pred_embds[i][indices, :])
-            self.appearance_memory_bank.update(pred_appearances[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w

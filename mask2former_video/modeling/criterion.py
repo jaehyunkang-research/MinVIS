@@ -216,6 +216,7 @@ class VideoSetCriterion(nn.Module):
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
+        main_indices = indices
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
@@ -240,7 +241,7 @@ class VideoSetCriterion(nn.Module):
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
-        return losses
+        return losses, main_indices
 
     def __repr__(self):
         head = "Criterion " + self.__class__.__name__
