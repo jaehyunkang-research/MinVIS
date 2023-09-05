@@ -29,6 +29,30 @@ from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
 
+class Memorybank(object):
+    def __init__(self, num_queries, hidden_dim, bank_size=3, tau=0.5):
+        self.bank_size = bank_size
+        self.tau = tau
+        self.num_queries = num_queries
+        self.size = 0
+
+        self.memory_bank = torch.zeros(self.bank_size, num_queries, hidden_dim).cuda()
+
+    def update(self, embeddings):
+        '''
+        Args:
+            embeddings: (Q, C)
+        '''
+        self.memory_bank = self.memory_bank.roll(1, dims=0)
+        self.memory_bank[0] = embeddings
+        self.size = min(self.size + 1, self.bank_size)
+
+    def get(self):
+        weight = self.size / torch.arange(1, self.size+1, device=self.memory_bank.device).float() + self.tau
+        temporal_embedding = (self.memory_bank[:self.size] * weight[:, None, None]).sum(0) / weight.sum()
+
+        return temporal_embedding
+
 
 @META_ARCH_REGISTRY.register()
 class VideoMaskFormer_frame(nn.Module):
@@ -98,6 +122,9 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.num_frames = num_frames
         self.window_inference = window_inference
+
+        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
+        self.appearance_memory_bank = Memorybank(num_queries, hidden_dim=1024, bank_size=3, tau=0.5)
 
         self.num_classes = num_classes
 
@@ -201,10 +228,11 @@ class VideoMaskFormer_frame(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         if not self.training and self.window_inference:
-            outputs = self.run_window_inference(images.tensor)
+            outputs, res_features = self.run_window_inference(images.tensor)
         else:
             features = self.backbone(images.tensor)
             outputs = self.sem_seg_head(features)
+            res_features = features['res4']
 
         if self.training:
             # mask classification target
@@ -223,7 +251,8 @@ class VideoMaskFormer_frame(nn.Module):
                     losses.pop(k)
             return losses
         else:
-            appearance_query = torch.einsum('q t d, t c d -> q t c', outputs['pred_masks'][0].flatten(2,).softmax(dim=-1), features['res2'].flatten(2,))
+            resize_mask = F.interpolate(outputs['pred_masks'][0], size=res_features.shape[-2:])
+            appearance_query = torch.einsum('q t d, t c d -> q t c', resize_mask.flatten(2,).softmax(dim=-1), res_features.flatten(2,))
             outputs = self.post_processing(outputs, appearance_query)
 
             mask_cls_results = outputs["pred_logits"]
@@ -270,9 +299,9 @@ class VideoMaskFormer_frame(nn.Module):
 
         return outputs, gt_instances
 
-    def match_from_embds(self, tgts, curs):
-        cur_embds, cur_appearances = curs
-        tgt_embds, tgt_appearances = tgts
+    def match_from_embds(self, tgts, curs, objectness):
+        cur_embds, cur_appearances = curs # 1 10 68
+        tgt_embds, tgt_appearances = tgts # 91 10 19
 
         cur_embds = cur_embds / cur_embds.norm(dim=1)[:, None]
         tgt_embds = tgt_embds / tgt_embds.norm(dim=1)[:, None]
@@ -286,9 +315,9 @@ class VideoMaskFormer_frame(nn.Module):
 
         cost_appearance = 1 - cos_sim
 
-        alpha = 0.4
+        alpha = (1 - objectness)[:, None]
 
-        C = 1.0 * (cost_embd * alpha + cost_appearance * (1 - alpha))
+        C = 1.0 * (cost_embd + cost_appearance * alpha)
         C = C.cpu()
 
         indices = linear_sum_assignment(C.transpose(0, 1))  # target x current
@@ -313,23 +342,21 @@ class VideoMaskFormer_frame(nn.Module):
 
         out_logits = []
         out_masks = []
-        out_embds = []
-        out_appearances = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
-        out_embds.append(pred_embds[0])
-        out_appearances.append(pred_appearances[0])
+        self.memory_bank.update(pred_embds[0])
+        self.appearance_memory_bank.update(pred_appearances[0])
 
         for i in range(1, len(pred_logits)):
-            tgts = out_embds[-1], out_appearances[-1]
+            tgts = self.memory_bank.get(), self.appearance_memory_bank.get()
             curs = pred_embds[i], pred_appearances[i]
 
-            indices = self.match_from_embds(tgts, curs)
+            indices = self.match_from_embds(tgts, curs, pred_logits[i].softmax(-1)[:, -1])
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
-            out_embds.append(pred_embds[i][indices, :])
-            out_appearances.append(pred_appearances[i][indices, :])
+            self.memory_bank.update(pred_embds[i][indices, :])
+            self.appearance_memory_bank.update(pred_appearances[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
@@ -347,12 +374,14 @@ class VideoMaskFormer_frame(nn.Module):
         if len(images_tensor) % window_size != 0:
             iters += 1
         out_list = []
+        res_features = []
         for i in range(iters):
             start_idx = i * window_size
             end_idx = (i+1) * window_size
 
             features = self.backbone(images_tensor[start_idx:end_idx])
             out = self.sem_seg_head(features)
+            res_features.append(features['res4'])
             del features['res2'], features['res3'], features['res4'], features['res5']
             for j in range(len(out['aux_outputs'])):
                 del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
@@ -364,7 +393,7 @@ class VideoMaskFormer_frame(nn.Module):
         outputs['pred_masks'] = torch.cat([x['pred_masks'] for x in out_list], dim=2).detach()
         outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=2).detach()
 
-        return outputs
+        return outputs, torch.cat(res_features, dim=0)
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
