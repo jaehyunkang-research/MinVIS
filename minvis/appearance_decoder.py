@@ -29,12 +29,13 @@ class AppearanceDecoder(nn.Module):
         # only use res2 feature
         self.num_feature_levels = len(in_channels)
         self.input_proj = nn.ModuleList()
+        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         for l in range(self.num_feature_levels):
             self.input_proj.append(nn.Sequential(
                 Conv2d(in_channels[l], hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
                 Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, norm=get_norm("GN", hidden_dim)),
             ))
-        self.appearance_aggregation = MLP(hidden_dim*self.num_feature_levels, hidden_dim, hidden_dim, 2)
+        self.appearance_norm = nn.LayerNorm(hidden_dim)
         self.appearance_embd = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
         self.track_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
@@ -97,7 +98,7 @@ class AppearanceDecoder(nn.Module):
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
 
-        _, bs, _ = src[0].shape
+        output = pred_embds.permute(3, 0, 2, 1).reshape(Q, B*T, C)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -115,16 +116,10 @@ class AppearanceDecoder(nn.Module):
             output = self.appearance_ffn_layers[i](
                 output
             )
-        
-        appearance_queries = []
-        for i in range(self.num_feature_levels):
-            resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:], mode='bilinear', align_corners=False).flatten(2).softmax(-1)
-            appearance_feature = self.input_proj[i](appearance_features[i]).reshape(B, T, C, -1)
-            appearance_query = torch.einsum('btqd,btcd->btqc', resize_mask.reshape(B, T, Q, -1), appearance_feature)
-            appearance_queries.append(appearance_query)
 
-        appearance_queries = self.appearance_aggregation(torch.cat(appearance_queries, dim=-1))
-        appearance_queries = self.appearance_embd(appearance_queries)
+        appearance_queries = output.reshape(Q, B, T, C).permute(1, 2, 0, 3)
+
+        appearance_queries = self.appearance_embd(self.appearance_norm(appearance_queries))
 
         if self.training:
             key_queries, ref_queries = appearance_queries.unbind(1)

@@ -162,7 +162,7 @@ class VideoMaskFormer_frame(nn.Module):
             hidden_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
             nheads=cfg.MODEL.MASK_FORMER.NHEADS,
             dim_feedforward=cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
-            appearance_layers=1,
+            appearance_layers=3,
             pre_norm=cfg.MODEL.MASK_FORMER.PRE_NORM,
             )
 
