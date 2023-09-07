@@ -5,30 +5,12 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from detectron2.config import configurable
-from detectron2.layers import Conv2d
+from detectron2.layers import Conv2d, get_norm
 
 from mask2former.modeling.transformer_decoder.mask2former_transformer_decoder import SelfAttentionLayer, CrossAttentionLayer, FFNLayer, MLP
 from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 import einops
 
-@torch.no_grad()
-def concat_all_gather(tensor):
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    indices = torch.full_like(tensor, torch.distributed.get_rank())
-    indices_gather = [torch.zeros(1, dtype=torch.long, device=tensor.device)
-        for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(indices_gather, torch.as_tensor(tensor.shape[0], device=tensor.device), async_op=False)
-    indices = torch.cat(indices_gather, dim=0)
-
-    tensors_gather = [torch.ones(indices[i], tensor.shape[-1], device=tensor.device)
-        for i in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-    output = torch.cat(tensors_gather, dim=0)
-
-    return output, indices
 class AppearanceDecoder(nn.Module):
 
     def __init__(
@@ -43,76 +25,97 @@ class AppearanceDecoder(nn.Module):
     ):
         super().__init__()
 
-        # positional encoding
-        N_steps = hidden_dim // 2
-        self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
-
-        # appearance decoder
-        self.num_heads = nheads
-        self.num_layers = appearance_layers
-
         # only use res2 feature
         self.num_feature_levels = len(in_channels)
         self.input_proj = nn.ModuleList()
         for l in range(self.num_feature_levels):
-            self.input_proj.append(Conv2d(in_channels[l], hidden_dim, kernel_size=1))
-            weight_init.c2_msra_fill(self.input_proj[-1])
-
-        self.appearance_norm = nn.LayerNorm(hidden_dim)
-        
+            self.input_proj.append(nn.Sequential(
+                Conv2d(in_channels[l], hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
+                Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, norm=get_norm("GN", hidden_dim)),
+            ))
         self.appearance_aggregation = MLP(hidden_dim*self.num_feature_levels, hidden_dim, hidden_dim, 2)
-        self.appearance_projection = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
-        self.appearance_prediction = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+        self.appearance_embd = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+
+        self.track_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
         self.criterion = nn.CosineSimilarity(dim=-1)
 
-    def forward(self, output, appearance_features, output_mask, indices=None):
+    def forward(self, pred_embds, appearance_features, indices=None):
         assert len(appearance_features) == self.num_feature_levels
 
-        output_mask = output_mask.squeeze(2).detach()
+        B, C, T, Q = pred_embds.shape
         
         appearance_queries = []
         for i in range(self.num_feature_levels):
-            appearance_feature = self.input_proj[i](appearance_features[i]).flatten(2)
-            appearance_query = torch.einsum('qbc,bcd->qbd', output, appearance_feature).softmax(dim=-1)
-            appearance_query = torch.einsum('qbd,bcd->qbc', appearance_query, appearance_feature)
+            appearance_feature = self.input_proj[i](appearance_features[i]).reshape(B, T, C, -1)
+            appearance_query = torch.einsum('bctq,btcd->btqd', pred_embds, appearance_feature).softmax(dim=-1)
+            appearance_query = torch.einsum('btqd,btcd->btqc', appearance_query, appearance_feature)
             appearance_queries.append(appearance_query)
 
         appearance_queries = self.appearance_aggregation(torch.cat(appearance_queries, dim=-1))
-        output_z = self.appearance_projection(self.appearance_norm(appearance_queries))
-        output_p = self.appearance_prediction(output_z)
+        appearance_queries = self.appearance_embd(appearance_queries)
 
         if self.training:
-            loss = self.loss(output_z, output_p, indices)
-            return {"loss_appearance": loss * 5}
+            key_queries, ref_queries = appearance_queries.unbind(1)
+
+            key_idx, ref_idx = self._get_permutation_idx(indices)
+            split_idx = [len(i[0]) for i in indices[::T]]
+
+            key_queries, ref_queries = key_queries[key_idx], ref_queries[ref_idx]
+            key_queries = self.track_head(key_queries)
+            ref_queries = self.track_head(ref_queries)
+
+            dists, cos_dists = self.match(key_queries, ref_queries, split_idx)
+            if len(dists) == 0:
+                loss = {'loss_reid': key_queries.sum()*0., 'loss_aux_cos': ref_queries.sum()*0.}
+            else:
+                loss = self.loss(dists, cos_dists)
+            return loss
             
-        return output_z
+        track_queries = self.track_head(appearance_queries)
+
+        return track_queries
     
-    def loss(self, z, p, indices):
-        T = 2 # only use two frames
-        B = len(indices) // T
-        idx0, idx1 = self._get_permutation_idx(indices)
+    def match(self, key, ref, indices):
+        key_queries = torch.split(key, indices)
+        ref_queries = torch.split(ref, indices)
 
-        z0, z1 = z.transpose(0,1).reshape(B, T, -1, z.shape[-1]).unbind(1)
-        p0, p1 = p.transpose(0,1).reshape(B, T, -1, p.shape[-1]).unbind(1)
-        z0, z1 = z0[idx0].detach(), z1[idx1].detach()
-        p0, p1 = p0[idx0], p1[idx1]
+        dists, cos_dists = [], []
+        for key_query, ref_query in zip(key_queries, ref_queries):
+            if len(key_query) == 0: continue
+            dist = torch.mm(key_query, ref_query.T)
+            cos_dist = torch.mm(F.normalize(key_query, dim=-1), F.normalize(ref_query, dim=-1).T)
+            dists.append(dist)
+            cos_dists.append(cos_dist)
 
-        with torch.cuda.amp.autocast(True):
-            loss = self.contrastive_loss(p0, z1) + self.contrastive_loss(p1, z0)
-        return loss
+        return dists, cos_dists
     
-    def contrastive_loss(self, q, k):
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
+    def loss(self, dists, cos_dists):
+        
+        loss_reid = 0.0
+        loss_aux_cos = 0.0
 
-        k, idx = concat_all_gather(k)
-        idx = torch.cumsum(idx, 0)
+        for dist, cos_dist in zip(dists, cos_dists):
+            label = torch.eye(dist.shape[0], device=dist.device)
 
-        logits = torch.einsum('nc,mc->nm', [q, k]) / 0.07
-        N = logits.size(0)
-        labels = torch.arange(idx[torch.distributed.get_rank()] - N, idx[torch.distributed.get_rank()], dtype=torch.long).cuda()
-        return nn.CrossEntropyLoss()(logits, labels) * (2 * 0.07)
+            pos_inds = (label == 1)
+            neg_inds = (label == 0)
+            dist_pos = dist * pos_inds.float()
+            dist_neg = dist * neg_inds.float()
+            dist_pos[neg_inds] = dist_pos[neg_inds] + float('inf')
+            dist_neg[pos_inds] = dist_neg[pos_inds] - float('inf')
+
+            _pos_expand = torch.repeat_interleave(dist_pos, dist.shape[1], dim=1)
+            _neg_expand = dist_neg.repeat(1, dist.shape[1])
+
+            x = F.pad((_neg_expand - _pos_expand), (0,1), value=0)
+            loss = torch.logsumexp(x, dim=1)# * (dist.shape[0] > 0).float()
+            loss_reid += loss.sum() / dist.shape[0]
+
+            loss = torch.abs(cos_dist - label.float())**2
+            loss_aux_cos += loss.sum() / dist.shape[0]
+
+        return {'loss_reid': loss_reid / len(dists), 'loss_aux_cos': loss_aux_cos / len(dists)}
 
     def _get_permutation_idx(self, indices):
         # permute targets following indices

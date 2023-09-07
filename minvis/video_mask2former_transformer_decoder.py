@@ -140,7 +140,6 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
                 predictions_class if self.mask_classification else None, predictions_mask
             ),
             'pred_embds': pred_embds,
-            'output': output,
         }
         
         return out
