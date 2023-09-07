@@ -59,14 +59,20 @@ class AppearanceDecoder(nn.Module):
             weight_init.c2_msra_fill(self.input_proj[-1])
 
         self.appearance_norm = nn.LayerNorm(hidden_dim)
+
+        self.reid_projection = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        self.reid_prediction = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
         
         self.appearance_aggregation = MLP(hidden_dim*self.num_feature_levels, hidden_dim, hidden_dim, 2)
         self.appearance_projection = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
         self.appearance_prediction = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+        self.total_projection = MLP(hidden_dim*2, hidden_dim, hidden_dim, 3)
+        self.total_prediction = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+
         self.criterion = nn.CosineSimilarity(dim=-1)
 
-    def forward(self, output, appearance_features, output_mask, indices=None):
+    def forward(self, output, appearance_features, output_mask, indices=None, targets=None):
         assert len(appearance_features) == self.num_feature_levels
 
         output_mask = output_mask.squeeze(2).detach()
@@ -79,19 +85,30 @@ class AppearanceDecoder(nn.Module):
             appearance_queries.append(appearance_query)
 
         appearance_queries = self.appearance_aggregation(torch.cat(appearance_queries, dim=-1))
-        output_z = self.appearance_projection(self.appearance_norm(appearance_queries))
-        output_p = self.appearance_prediction(output_z)
+        output_appearance_z = self.appearance_projection(self.appearance_norm(appearance_queries))
+        output_appearance_p = self.appearance_prediction(output_appearance_z)
+
+        output_reid_z = self.reid_projection(output)
+        output_reid_p = self.reid_prediction(output_reid_z)
+
+        output_z = self.total_projection(torch.cat([appearance_queries, output], dim=-1))
+        output_p = self.total_prediction(output_z)
 
         if self.training:
-            loss = self.loss(output_z, output_p, indices)
-            return {"loss_appearance": loss * 5}
+            total_loss = self.loss(output_z, output_p, indices, targets)
+            appearance_loss = self.loss(output_appearance_z, output_appearance_p, indices, targets)
+            reid_loss = self.loss(output_reid_z, output_reid_p, indices)
+            return {
+                "loss_total": total_loss * 3, 
+                "loss_appearance": appearance_loss, 
+                "loss_reid": reid_loss}
             
         return output_z
     
-    def loss(self, z, p, indices):
+    def loss(self, z, p, indices, targets=None):
         T = 2 # only use two frames
         B = len(indices) // T
-        idx0, idx1 = self._get_permutation_idx(indices)
+        idx0, idx1 = self._get_permutation_idx(indices, targets)
 
         z0, z1 = z.transpose(0,1).reshape(B, T, -1, z.shape[-1]).unbind(1)
         p0, p1 = p.transpose(0,1).reshape(B, T, -1, p.shape[-1]).unbind(1)
@@ -114,9 +131,15 @@ class AppearanceDecoder(nn.Module):
         labels = torch.arange(idx[torch.distributed.get_rank()] - N, idx[torch.distributed.get_rank()], dtype=torch.long).cuda()
         return nn.CrossEntropyLoss()(logits, labels) * (2 * 0.07)
 
-    def _get_permutation_idx(self, indices):
+    def _get_permutation_idx(self, indices, targets=None):
         # permute targets following indices
         sorted_idx = [src[tgt.argsort()] for src, tgt in indices]
+        if targets:
+            targets = [t['ids'] for t in targets]
+            for i in range(0, len(targets), 2):
+                valid = ((targets[i] != -1) & (targets[i+1] != -1)).squeeze(1).cpu()
+                sorted_idx[i] = sorted_idx[i][valid]
+                sorted_idx[i+1] = sorted_idx[i+1][valid]
         batch_idx0 = torch.cat([torch.full_like(src, i) for i, src in enumerate(sorted_idx[::2])])
         src_idx0 = torch.cat([src for src in sorted_idx[::2]])
         batch_idx1 = torch.cat([torch.full_like(src, i) for i, src in enumerate(sorted_idx[1::2])])
