@@ -24,6 +24,7 @@ class AppearanceDecoder(nn.Module):
         pre_norm: bool,
     ):
         super().__init__()
+        self.pe_layer = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
 
         # only use res2 feature
         self.num_feature_levels = len(in_channels)
@@ -40,11 +41,80 @@ class AppearanceDecoder(nn.Module):
 
         self.criterion = nn.CosineSimilarity(dim=-1)
 
+        # appearance decoder
+        self.num_heads = nheads
+        self.num_layers = appearance_layers
+        self.appearance_self_attention_layers = nn.ModuleList()
+        self.appearance_cross_attention_layers = nn.ModuleList()
+        self.appearance_ffn_layers = nn.ModuleList()
+
+        for _ in range(self.num_layers):
+            self.appearance_self_attention_layers.append(
+                SelfAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.appearance_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.appearance_ffn_layers.append(
+                FFNLayer(
+                    d_model=hidden_dim,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
     def forward(self, pred_embds, appearance_features, output_masks, indices=None):
         assert len(appearance_features) == self.num_feature_levels
+        src, pos = [], []
+        attn_mask = []
 
         B, C, T, Q = pred_embds.shape
         output_masks = output_masks.transpose(1, 2).flatten(0, 1)
+
+        for i in range(self.num_feature_levels):
+            pos.append(self.pe_layer(appearance_features[i], None).flatten(2))
+            src.append(self.input_proj[i](appearance_features[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+
+            resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:])
+            attn_resize_mask = (resize_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0,1) < 0.5).bool()
+            attn_resize_mask[torch.where(attn_resize_mask[:, :, None].sum(-1) == attn_resize_mask.shape[-1])] = False
+            attn_mask.append(attn_resize_mask)
+
+            # flatten NxCxHxW to HWxNxC
+            pos[-1] = pos[-1].permute(2, 0, 1)
+            src[-1] = src[-1].permute(2, 0, 1)
+
+        _, bs, _ = src[0].shape
+
+        for i in range(self.num_layers):
+            level_index = i % self.num_feature_levels
+            # attention: cross-attention first
+            output = self.appearance_cross_attention_layers[i](
+                output, src[level_index],
+                memory_mask=attn_mask[level_index],
+                memory_key_padding_mask=None,
+                pos=pos[level_index],
+            )
+            output = self.appearance_self_attention_layers[i](
+                output, tgt_mask=None,
+                tgt_key_padding_mask=None,
+            )
+            output = self.appearance_ffn_layers[i](
+                output
+            )
         
         appearance_queries = []
         for i in range(self.num_feature_levels):
