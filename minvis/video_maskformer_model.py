@@ -249,13 +249,13 @@ class VideoMaskFormer_frame(nn.Module):
                     losses.pop(k)
 
             appearance_features = [f.detach() for f in features.values()][:3]
-            appearance_loss = self.appearance_decoder(outputs['pred_embds'], appearance_features, indices)
+            appearance_loss = self.appearance_decoder(outputs['pred_embds'], appearance_features, outputs['pred_masks'], indices)
             losses.update(appearance_loss)
                     
             return losses
         else:
             appearance_features = [f.detach() for f in features.values()][:3]
-            appearance_embds = self.appearance_decoder(outputs['pred_embds'], appearance_features)
+            appearance_embds = self.appearance_decoder(outputs['pred_embds'], appearance_features, einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
             outputs = self.post_processing(outputs, appearance_embds)
 
             mask_cls_results = outputs["pred_logits"]

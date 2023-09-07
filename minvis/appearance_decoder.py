@@ -40,16 +40,17 @@ class AppearanceDecoder(nn.Module):
 
         self.criterion = nn.CosineSimilarity(dim=-1)
 
-    def forward(self, pred_embds, appearance_features, indices=None):
+    def forward(self, pred_embds, appearance_features, output_masks, indices=None):
         assert len(appearance_features) == self.num_feature_levels
 
         B, C, T, Q = pred_embds.shape
+        output_masks = output_masks.transpose(1, 2).flatten(0, 1)
         
         appearance_queries = []
         for i in range(self.num_feature_levels):
+            resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:], mode='bilinear', align_corners=False).flatten(2).softmax(-1)
             appearance_feature = self.input_proj[i](appearance_features[i]).reshape(B, T, C, -1)
-            appearance_query = torch.einsum('bctq,btcd->btqd', pred_embds, appearance_feature).softmax(dim=-1)
-            appearance_query = torch.einsum('btqd,btcd->btqc', appearance_query, appearance_feature)
+            appearance_query = torch.einsum('btqd,btcd->btqc', resize_mask.reshape(B, T, Q, -1), appearance_feature)
             appearance_queries.append(appearance_query)
 
         appearance_queries = self.appearance_aggregation(torch.cat(appearance_queries, dim=-1))
