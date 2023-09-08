@@ -59,6 +59,7 @@ from minvis import (
     build_detection_test_loader,
     get_detection_dataset_dicts,
 )
+from minvis.data_video.dataset_mapper import CocoClipDatasetMapper
 
 
 class Trainer(DefaultTrainer):
@@ -83,7 +84,10 @@ class Trainer(DefaultTrainer):
     @classmethod
     def build_train_loader(cls, cfg):
         dataset_name = cfg.DATASETS.TRAIN[0]
-        mapper = YTVISDatasetMapper(cfg, is_train=True)
+        if dataset_name.startswith("coco"):
+            mapper = CocoClipDatasetMapper(cfg, is_train=True, is_tgt=False, src_dataset_name=dataset_name, tgt_dataset_name=cfg.DATASETS.TRAIN[1])
+        else:
+            mapper = YTVISDatasetMapper(cfg, is_train=True)
 
         dataset_dict = get_detection_dataset_dicts(
             dataset_name,
@@ -96,7 +100,10 @@ class Trainer(DefaultTrainer):
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
         dataset_name = cfg.DATASETS.TEST[0]
-        mapper = YTVISDatasetMapper(cfg, is_train=False)
+        if dataset_name.startswith("coco"):
+            mapper = CocoClipDatasetMapper(cfg, is_train=False, is_tgt=False, src_dataset_name=dataset_name)
+        else:
+            mapper = YTVISDatasetMapper(cfg, is_train=False)
         return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
 
     @classmethod
