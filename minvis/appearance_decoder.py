@@ -79,7 +79,7 @@ class AppearanceDecoder(nn.Module):
                 )
             )
 
-    def forward(self, pred_embds, appearance_features, output_masks, indices=None):
+    def forward(self, pred_embds, appearance_features, output_masks, indices=None, targets=None):
         assert len(appearance_features) == self.num_feature_levels
         src, pos = [], []
         attn_mask = []
@@ -130,8 +130,8 @@ class AppearanceDecoder(nn.Module):
             key_pred_embds, ref_pred_embds = pred_embds.unbind(1)
             key_gating, ref_gating = query_gating.unbind(1)
 
-            key_idx, ref_idx = self._get_permutation_idx(indices)
-            split_idx = [len(i[0]) for i in indices[::T]]
+            valid_indices = [t['ids'] != -1 for t in targets]
+            key_idx, ref_idx, split_idx = self._get_permutation_idx(indices, valid_indices)
 
             key_queries, ref_queries = key_queries[key_idx], ref_queries[ref_idx]
             key_pred_embds, ref_pred_embds = key_pred_embds[key_idx], ref_pred_embds[ref_idx]
@@ -193,11 +193,17 @@ class AppearanceDecoder(nn.Module):
 
         return {'loss_reid': loss_reid / len(dists), 'loss_aux_cos': loss_aux_cos / len(dists)}
 
-    def _get_permutation_idx(self, indices):
+    def _get_permutation_idx(self, indices, valid_indices):
         # permute targets following indices
         sorted_idx = [src[tgt.argsort()] for src, tgt in indices]
+        split_idx = []
+        for i in range(0, len(sorted_idx), 2):
+            valid_idx = (valid_indices[i] & valid_indices[i+1]).squeeze(1).cpu()
+            sorted_idx[i] = sorted_idx[i][valid_idx]
+            sorted_idx[i+1] = sorted_idx[i+1][valid_idx]
+            split_idx.append(valid_idx.sum())
         batch_idx0 = torch.cat([torch.full_like(src, i) for i, src in enumerate(sorted_idx[::2])])
         src_idx0 = torch.cat([src for src in sorted_idx[::2]])
         batch_idx1 = torch.cat([torch.full_like(src, i) for i, src in enumerate(sorted_idx[1::2])])
         src_idx1 = torch.cat([src for src in sorted_idx[1::2]])
-        return (batch_idx0, src_idx0), (batch_idx1, src_idx1)
+        return (batch_idx0, src_idx0), (batch_idx1, src_idx1), split_idx

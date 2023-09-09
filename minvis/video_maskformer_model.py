@@ -249,7 +249,7 @@ class VideoMaskFormer_frame(nn.Module):
                     losses.pop(k)
 
             appearance_features = [f.detach() for f in features.values()][:3]
-            appearance_loss = self.appearance_decoder(outputs['pred_embds'], appearance_features, outputs['pred_masks'], indices)
+            appearance_loss = self.appearance_decoder(outputs['pred_embds'], appearance_features, outputs['pred_masks'], indices, targets)
             losses.update(appearance_loss)
                     
             return losses
