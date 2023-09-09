@@ -325,7 +325,7 @@ class VideoMaskFormer_frame(nn.Module):
         # pred_masks: 1 q t h w
         pred_logits = pred_logits[0]
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
-        pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
+        pred_embds = pred_embds[0]
         appearance_embds = appearance_embds[0]
 
         pred_logits = list(torch.unbind(pred_logits))

@@ -40,6 +40,8 @@ class AppearanceDecoder(nn.Module):
 
         self.track_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+        self.gating_head = MLP(hidden_dim, hidden_dim, 1, 1)
+
         self.criterion = nn.CosineSimilarity(dim=-1)
 
         # appearance decoder
@@ -82,7 +84,7 @@ class AppearanceDecoder(nn.Module):
         src, pos = [], []
         attn_mask = []
 
-        B, C, T, Q = pred_embds.shape
+        B, T, Q, C = pred_embds.shape
         output_masks = output_masks.transpose(1, 2).flatten(0, 1)
 
         for i in range(self.num_feature_levels):
@@ -98,7 +100,9 @@ class AppearanceDecoder(nn.Module):
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
 
-        output = pred_embds.permute(3, 0, 2, 1).reshape(Q, B*T, C)
+        output = pred_embds.flatten(0, 1).transpose(0, 1)
+
+        query_gating = self.gating_head(pred_embds).sigmoid()
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -118,6 +122,7 @@ class AppearanceDecoder(nn.Module):
             )
 
         appearance_queries = output.reshape(Q, B, T, C).permute(1, 2, 0, 3)
+        appearance_queries = appearance_queries * query_gating + pred_embds * (1 - query_gating)
 
         appearance_queries = self.appearance_embd(self.appearance_norm(appearance_queries))
 

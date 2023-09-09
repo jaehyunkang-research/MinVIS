@@ -131,7 +131,7 @@ class VideoMultiScaleMaskedTransformerDecoder_frame(VideoMultiScaleMaskedTransfo
             predictions_class[i] = einops.rearrange(predictions_class[i], '(b t) q c -> b t q c', t=t)
 
         pred_embds = self.decoder_norm(output)
-        pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> b c t q', t=t)
+        pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> b t q c', t=t)
 
         out = {
             'pred_logits': predictions_class[-1],
