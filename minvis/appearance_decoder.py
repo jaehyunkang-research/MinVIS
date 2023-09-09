@@ -122,17 +122,21 @@ class AppearanceDecoder(nn.Module):
             )
 
         appearance_queries = output.reshape(Q, B, T, C).permute(1, 2, 0, 3)
-        appearance_queries = appearance_queries * query_gating + pred_embds * (1 - query_gating)
 
         appearance_queries = self.appearance_embd(self.appearance_norm(appearance_queries))
 
         if self.training:
             key_queries, ref_queries = appearance_queries.unbind(1)
+            key_pred_embds, ref_pred_embds = pred_embds.unbind(1)
+            key_gating, ref_gating = query_gating.unbind(1)
 
             key_idx, ref_idx = self._get_permutation_idx(indices)
             split_idx = [len(i[0]) for i in indices[::T]]
 
             key_queries, ref_queries = key_queries[key_idx], ref_queries[ref_idx]
+            key_pred_embds, ref_pred_embds = key_pred_embds[key_idx], ref_pred_embds[ref_idx]
+            key_queries = key_queries * key_gating[key_idx] + key_pred_embds * (1 - key_gating[key_idx])
+            ref_queries = ref_queries * ref_gating[ref_idx] + ref_pred_embds * (1 - ref_gating[ref_idx])
             key_queries = self.track_head(key_queries)
             ref_queries = self.track_head(ref_queries)
 
@@ -143,6 +147,7 @@ class AppearanceDecoder(nn.Module):
                 loss = self.loss(dists, cos_dists)
             return loss
             
+        appearance_queries = appearance_queries * query_gating + pred_embds * (1 - query_gating)
         track_queries = self.track_head(appearance_queries)
 
         return track_queries
