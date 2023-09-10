@@ -102,7 +102,6 @@ class AppearanceDecoder(nn.Module):
 
         output = pred_embds.flatten(0, 1).transpose(0, 1)
 
-        query_gating = self.gating_head(pred_embds).sigmoid()
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -123,6 +122,8 @@ class AppearanceDecoder(nn.Module):
 
         appearance_queries = output.reshape(Q, B, T, C).permute(1, 2, 0, 3)
 
+        query_gating = self.gating_head(appearance_queries).sigmoid()
+
         appearance_queries = self.appearance_embd(self.appearance_norm(appearance_queries))
 
         if self.training:
@@ -135,8 +136,8 @@ class AppearanceDecoder(nn.Module):
 
             key_queries, ref_queries = key_queries[key_idx], ref_queries[ref_idx]
             key_pred_embds, ref_pred_embds = key_pred_embds[key_idx], ref_pred_embds[ref_idx]
-            key_queries = key_queries * key_gating[key_idx] + key_pred_embds * (1 - key_gating[key_idx])
-            ref_queries = ref_queries * ref_gating[ref_idx] + ref_pred_embds * (1 - ref_gating[ref_idx])
+            key_queries = key_queries * (1 - key_gating[key_idx]) + key_pred_embds * key_gating[key_idx]
+            ref_queries = ref_queries * (1 - ref_gating[ref_idx]) + ref_pred_embds * ref_gating[ref_idx]
             key_queries = self.track_head(key_queries)
             ref_queries = self.track_head(ref_queries)
 
@@ -147,7 +148,7 @@ class AppearanceDecoder(nn.Module):
                 loss = self.loss(dists, cos_dists)
             return loss
             
-        appearance_queries = appearance_queries * query_gating + pred_embds * (1 - query_gating)
+        appearance_queries = appearance_queries * (1 - query_gating) + pred_embds * query_gating # 여기 반대임!!!!!!
         track_queries = self.track_head(appearance_queries)
 
         return track_queries
@@ -191,7 +192,7 @@ class AppearanceDecoder(nn.Module):
             loss = torch.abs(cos_dist - label.float())**2
             loss_aux_cos += loss.sum() / dist.shape[0]
 
-        return {'loss_reid': loss_reid / len(dists), 'loss_aux_cos': loss_aux_cos / len(dists)}
+        return {'loss_reid': loss_reid / len(dists) * 2, 'loss_aux_cos': loss_aux_cos / len(dists) * 3}
 
     def _get_permutation_idx(self, indices, valid_indices):
         # permute targets following indices

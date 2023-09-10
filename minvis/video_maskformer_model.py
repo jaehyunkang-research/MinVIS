@@ -13,6 +13,7 @@ import einops
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
@@ -30,6 +31,30 @@ from .appearance_decoder import AppearanceDecoder
 from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
+
+class Memorybank(object):
+    def __init__(self, num_queries, hidden_dim, bank_size=3, tau=0.5):
+        self.bank_size = bank_size
+        self.tau = tau
+        self.num_queries = num_queries
+        self.size = 0
+
+        self.memory_bank = torch.zeros(self.bank_size, num_queries, hidden_dim).cuda()
+
+    def update(self, embeddings):
+        '''
+        Args:
+            embeddings: (Q, C)
+        '''
+        self.memory_bank = self.memory_bank.roll(1, dims=0)
+        self.memory_bank[0] = embeddings
+        self.size = min(self.size + 1, self.bank_size)
+
+    def get(self):
+        weight = self.size / torch.arange(1, self.size+1, device=self.memory_bank.device).float() + self.tau
+        temporal_embedding = (self.memory_bank[:self.size] * weight[:, None, None]).sum(0) / weight.sum()
+
+        return temporal_embedding
 
 
 @META_ARCH_REGISTRY.register()
@@ -113,6 +138,8 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.appearance_decoder = appearance_decoder
 
+        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
+
     @classmethod
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
@@ -179,7 +206,7 @@ class VideoMaskFormer_frame(nn.Module):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            "freeze_detector": True,
+            "freeze_detector": False,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,
@@ -226,8 +253,8 @@ class VideoMaskFormer_frame(nn.Module):
         if not self.training and self.window_inference:
             outputs = self.run_window_inference(images.tensor)
         else:
-            features = self.backbone(images.tensor)
-            outputs = self.sem_seg_head(features)
+            features = checkpoint(self.backbone, images.tensor, use_reentrant=False)
+            outputs = checkpoint(self.sem_seg_head, features, use_reentrant=False)
 
         if self.training:
             # mask classification target
