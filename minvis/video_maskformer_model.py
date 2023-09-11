@@ -251,7 +251,7 @@ class VideoMaskFormer_frame(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         if not self.training and self.window_inference:
-            outputs = self.run_window_inference(images.tensor)
+            outputs, appearance_embds = self.run_window_inference(images.tensor)
         else:
             features = checkpoint(self.backbone, images.tensor, use_reentrant=False)
             outputs = checkpoint(self.sem_seg_head, features, use_reentrant=False)
@@ -281,8 +281,9 @@ class VideoMaskFormer_frame(nn.Module):
                     
             return losses
         else:
-            appearance_features = [f.detach() for f in features.values()][:3]
-            appearance_embds = self.appearance_decoder(outputs['pred_embds'], appearance_features, einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
+            if not self.window_inference:
+                appearance_features = [f.detach() for f in features.values()][:3]
+                appearance_embds = self.appearance_decoder(outputs['pred_embds'], appearance_features, einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
             outputs = self.post_processing(outputs, appearance_embds)
 
             mask_cls_results = outputs["pred_logits"]
@@ -366,16 +367,16 @@ class VideoMaskFormer_frame(nn.Module):
         out_appearance_embds = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
-        out_embds.append(pred_embds[0])
+        self.memory_bank.update(pred_embds[0])
         out_appearance_embds.append(appearance_embds[0])
 
         for i in range(1, len(pred_logits)):
-            # indices = self.match_from_embds(out_embds[-1], pred_embds[i])
-            indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
+            indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
+            # indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
-            out_embds.append(pred_embds[i][indices, :])
+            self.memory_bank.update(pred_embds[i][indices, :])
             out_appearance_embds.append(appearance_embds[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)
@@ -394,24 +395,29 @@ class VideoMaskFormer_frame(nn.Module):
         if len(images_tensor) % window_size != 0:
             iters += 1
         out_list = []
+        appearance_list = []
         for i in range(iters):
             start_idx = i * window_size
             end_idx = (i+1) * window_size
 
             features = self.backbone(images_tensor[start_idx:end_idx])
             out = self.sem_seg_head(features)
-            del features['res2'], features['res3'], features['res4'], features['res5']
+            appearance_features = [f.detach() for f in features.values()][:3]
+            appearance_embds = self.appearance_decoder(out['pred_embds'], appearance_features, einops.rearrange(out['pred_masks'], 'b q t h w -> (b t) q () h w'))
+            del features['res2'], features['res3'], features['res4'], features['res5'], appearance_features
             for j in range(len(out['aux_outputs'])):
                 del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
             out_list.append(out)
+            appearance_list.append(appearance_embds)
 
         # merge outputs
         outputs = {}
         outputs['pred_logits'] = torch.cat([x['pred_logits'] for x in out_list], dim=1).detach()
         outputs['pred_masks'] = torch.cat([x['pred_masks'] for x in out_list], dim=2).detach()
-        outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=2).detach()
+        outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=1).detach()
+        appearance_embds = torch.cat(appearance_list, dim=1).detach()
 
-        return outputs
+        return outputs, appearance_embds
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
