@@ -55,7 +55,6 @@ class AppearanceDecoder(nn.Module):
 
         output = pred_embds.flatten(0, 1)
 
-
         appearance_queries = []
         for i in range(self.num_layers):
             appearance_feature = self.input_proj[i](appearance_features[i]).flatten(2)
@@ -75,8 +74,8 @@ class AppearanceDecoder(nn.Module):
             key_gating, ref_gating = query_gating.unbind(1)
 
             valid_indices = [t['ids'].squeeze(1) != -1 for t in targets]
-            key_queries = key_queries * (1 - key_gating) + key_pred_embds * key_gating
-            ref_queries = ref_queries * (1 - ref_gating) + ref_pred_embds * ref_gating
+            key_queries = key_queries * key_gating + key_pred_embds * (1 - key_gating)
+            ref_queries = ref_queries * ref_gating + ref_pred_embds * (1 - ref_gating)
             key_queries = self.track_head(key_queries)
             ref_queries = self.track_head(ref_queries)
 
@@ -87,7 +86,7 @@ class AppearanceDecoder(nn.Module):
                 loss = self.loss(dists, cos_dists, labels)
             return loss
             
-        appearance_queries = appearance_queries * (1 - query_gating) + pred_embds * query_gating # 여기 반대임!!!!!!
+        appearance_queries = appearance_queries * query_gating + pred_embds * (1 - query_gating)
         track_queries = self.track_head(appearance_queries)
 
         return track_queries
