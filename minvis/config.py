@@ -10,6 +10,8 @@ from detectron2.config import CfgNode as CN
 
 
 def add_minvis_config(cfg):
+    cfg.DATASETS.DATASET_RATIO = []
+    
     cfg.INPUT.SAMPLING_FRAME_RATIO = 1.0
 
     # Pseudo Data Use

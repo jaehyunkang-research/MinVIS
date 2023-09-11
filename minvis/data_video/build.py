@@ -4,6 +4,7 @@
 import itertools
 import logging
 import torch.utils.data
+from typing import Collection, Sequence
 
 from detectron2.config import CfgNode, configurable
 from detectron2.data.build import (
@@ -16,6 +17,8 @@ from detectron2.data.common import DatasetFromList, MapDataset
 from detectron2.data.dataset_mapper import DatasetMapper
 from detectron2.data.samplers import InferenceSampler, TrainingSampler
 from detectron2.utils.comm import get_world_size
+
+from .combined_loader import CombinedDataLoader, Loader
 
 
 def _compute_num_images_per_worker(cfg: CfgNode):
@@ -111,10 +114,10 @@ def get_detection_dataset_dicts(
     return dataset_dicts
 
 
-def _train_loader_from_config(cfg, mapper, *, dataset=None, sampler=None):
+def _train_loader_from_config(cfg, mapper, dataset_name=None, *, dataset=None, sampler=None):
     if dataset is None:
         dataset = get_detection_dataset_dicts(
-            cfg.DATASETS.TRAIN,
+            dataset_name,
             filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
             proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN if cfg.MODEL.LOAD_PROPOSALS else None,
         )
@@ -136,6 +139,10 @@ def _train_loader_from_config(cfg, mapper, *, dataset=None, sampler=None):
         "aspect_ratio_grouping": cfg.DATALOADER.ASPECT_RATIO_GROUPING,
         "num_workers": cfg.DATALOADER.NUM_WORKERS,
     }
+
+def build_combined_loader(cfg: CfgNode, loaders: Collection[Loader], ratios: Sequence[float]):
+    images_per_worker = _compute_num_images_per_worker(cfg)
+    return CombinedDataLoader(loaders, images_per_worker, ratios)
 
 
 # TODO can allow dataset as an iterable or IterableDataset to make this function more general

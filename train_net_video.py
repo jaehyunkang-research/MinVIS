@@ -55,6 +55,7 @@ from minvis import (
     YTVISDatasetMapper,
     YTVISEvaluator,
     add_minvis_config,
+    build_combined_loader,
     build_detection_train_loader,
     build_detection_test_loader,
     get_detection_dataset_dicts,
@@ -83,19 +84,32 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
-        dataset_name = cfg.DATASETS.TRAIN[0]
-        if dataset_name.startswith("coco"):
-            mapper = CocoClipDatasetMapper(cfg, is_train=True, is_tgt=False, src_dataset_name=dataset_name, tgt_dataset_name=cfg.DATASETS.TRAIN[1])
+        mappers = []
+        for d_i, dataset_name in enumerate(cfg.DATASETS.TRAIN):
+            if dataset_name.startswith('coco'):
+                mappers.append(
+                    CocoClipDatasetMapper(
+                        cfg, is_train=True, is_tgt=(d_i==len(cfg.DATASETS.TRAIN)-1), src_dataset_name=dataset_name
+                    )
+                )
+            elif dataset_name.startswith('ytvis') or dataset_name.startswith('ovis'):
+                mappers.append(
+                    YTVISDatasetMapper(cfg, is_train=True, is_tgt=(d_i==len(cfg.DATASETS.TRAIN)-1), src_dataset_name=dataset_name)
+                )
+            else:
+                raise NotImplementedError
+        assert len(mappers) > 0, "No dataset is chosen!"
+
+        if len(mappers) == 1:
+            mapper = mappers[0]
+            return build_detection_train_loader(cfg, mapper=mapper, dataset_name=cfg.DATASETS.TRAIN[0])
         else:
-            mapper = YTVISDatasetMapper(cfg, is_train=True)
-
-        dataset_dict = get_detection_dataset_dicts(
-            dataset_name,
-            filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
-            proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN if cfg.MODEL.LOAD_PROPOSALS else None,
-        )
-
-        return build_detection_train_loader(cfg, mapper=mapper, dataset=dataset_dict)
+            loaders = [
+                build_detection_train_loader(cfg, mapper=mapper, dataset_name=dataset_name)
+                for mapper, dataset_name in zip(mappers, cfg.DATASETS.TRAIN)
+            ]
+            combined_data_loader = build_combined_loader(cfg, loaders, cfg.DATASETS.DATASET_RATIO)
+            return combined_data_loader
 
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
