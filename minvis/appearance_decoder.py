@@ -132,16 +132,12 @@ class AppearanceDecoder(nn.Module):
             key_gating, ref_gating = query_gating.unbind(1)
 
             valid_indices = [t['ids'].squeeze(1) != -1 for t in targets]
-            key_idx, ref_idx, split_idx, labels = self._get_permutation_idx(indices, valid_indices)
-
-            key_queries, ref_queries = key_queries[key_idx], ref_queries[ref_idx]
-            key_pred_embds, ref_pred_embds = key_pred_embds[key_idx], ref_pred_embds[ref_idx]
-            key_queries = key_queries * (1 - key_gating[key_idx]) + key_pred_embds * key_gating[key_idx]
-            ref_queries = ref_queries * (1 - ref_gating[ref_idx]) + ref_pred_embds * ref_gating[ref_idx]
+            key_queries = key_queries * (1 - key_gating) + key_pred_embds * key_gating
+            ref_queries = ref_queries * (1 - ref_gating) + ref_pred_embds * ref_gating
             key_queries = self.track_head(key_queries)
             ref_queries = self.track_head(ref_queries)
 
-            dists, cos_dists = self.match(key_queries, ref_queries, split_idx)
+            dists, cos_dists, labels = self.match(key_queries, ref_queries, indices, valid_indices)
             if len(dists) == 0:
                 loss = {'loss_reid': key_queries.sum()*0., 'loss_aux_cos': ref_queries.sum()*0.}
             else:
@@ -153,19 +149,23 @@ class AppearanceDecoder(nn.Module):
 
         return track_queries
     
-    def match(self, key, ref, indices):
-        key_queries = torch.split(key, indices)
-        ref_queries = torch.split(ref, indices)
+    def match(self, key, ref, indices, valid_indices):
+        sorted_idx = [src[tgt.argsort()] for src, tgt in indices]
+        dists, cos_dists, labels = [], [], []
+        for i, (key_embed, ref_embed) in enumerate(zip(key, ref)):
+            b = 2 * i
+            valid_idx = (valid_indices[b] & valid_indices[b+1]).cpu()
+            anchor = key_embed[sorted_idx[b][valid_idx]] 
+            dist = torch.einsum('ac, kc -> ak', anchor, ref_embed)
+            cos_dist = torch.einsum('ac, kc -> ak', F.normalize(anchor, dim=-1), F.normalize(ref_embed, dim=-1))
+            label = sorted_idx[b+1][valid_idx].to(anchor.device)
+            label_ = torch.zeros_like(dist).scatter_(1, label[:, None], 1)
 
-        dists, cos_dists = [], []
-        for key_query, ref_query in zip(key_queries, ref_queries):
-            if len(key_query) == 0: continue
-            dist = torch.mm(key_query, ref_query.T)
-            cos_dist = torch.mm(F.normalize(key_query, dim=-1), F.normalize(ref_query, dim=-1).T)
             dists.append(dist)
             cos_dists.append(cos_dist)
+            labels.append(label_)
 
-        return dists, cos_dists
+        return dists, cos_dists, labels
     
     def loss(self, dists, cos_dists, labels):
         
@@ -174,7 +174,6 @@ class AppearanceDecoder(nn.Module):
         num_instances = sum([len(dist) for dist in dists])
 
         for dist, cos_dist, label in zip(dists, cos_dists, labels):
-            label = torch.diag(label)
             pos_inds = (label == 1)
             neg_inds = (label == 0)
             dist_pos = dist * pos_inds.float()
