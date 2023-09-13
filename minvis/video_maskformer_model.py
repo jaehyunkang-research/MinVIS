@@ -206,7 +206,7 @@ class VideoMaskFormer_frame(nn.Module):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            "freeze_detector": False,
+            "freeze_detector": True,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,

@@ -86,13 +86,14 @@ class AppearanceDecoder(nn.Module):
 
         B, T, Q, C = pred_embds.shape
         output_masks = output_masks.transpose(1, 2).flatten(0, 1).detach()
+        output_masks = (output_masks.sigmoid() > 0.5).float()
 
         for i in range(self.num_feature_levels):
             pos.append(self.pe_layer(appearance_features[i], None).flatten(2))
             src.append(self.input_proj[i](appearance_features[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
 
             resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:])
-            attn_resize_mask = (resize_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0,1) < 0.5).bool()
+            attn_resize_mask = (resize_mask.flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0,1) == 0).bool()
             attn_resize_mask[torch.where(attn_resize_mask[:, :, None].sum(-1) == attn_resize_mask.shape[-1])] = False
             attn_mask.append(attn_resize_mask)
 
