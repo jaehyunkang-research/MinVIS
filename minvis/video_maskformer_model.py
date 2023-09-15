@@ -27,6 +27,7 @@ from mask2former_video.modeling.matcher import VideoHungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
 
 from .appearance_decoder import AppearanceDecoder
+from .appearance_criterion import AppearanceCriterion
 
 from scipy.optimize import linear_sum_assignment
 
@@ -71,6 +72,7 @@ class VideoMaskFormer_frame(nn.Module):
         sem_seg_head: nn.Module,
         criterion: nn.Module,
         appearance_decoder: nn.Module,
+        appearance_criterion: nn.Module,
         num_queries: int,
         object_mask_threshold: float,
         overlap_threshold: float,
@@ -137,6 +139,7 @@ class VideoMaskFormer_frame(nn.Module):
         self.freeze_detector = freeze_detector
 
         self.appearance_decoder = appearance_decoder
+        self.appearance_criterion = appearance_criterion
 
         self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=1, tau=0.5)
 
@@ -184,6 +187,9 @@ class VideoMaskFormer_frame(nn.Module):
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
         )
 
+        appearance_weight_dict = {"loss_ce": class_weight, "loss_reid": 2.0, "loss_aux_cos": 3.0}
+        appearance_losses = ["labels", "reid"]
+
         appearance_decoder = AppearanceDecoder(
             in_channels=[256, 512, 1024],
             hidden_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
@@ -191,13 +197,26 @@ class VideoMaskFormer_frame(nn.Module):
             dim_feedforward=cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
             appearance_layers=3,
             pre_norm=cfg.MODEL.MASK_FORMER.PRE_NORM,
+            num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
             )
+        
+        appearance_criterion = AppearanceCriterion(
+            sem_seg_head.num_classes,
+            matcher=matcher,
+            weight_dict=appearance_weight_dict,
+            eos_coef=no_object_weight,
+            losses=appearance_losses,
+            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
+            importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+        )
 
         return {
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "criterion": criterion,
             "appearance_decoder": appearance_decoder,
+            "appearance_criterion": appearance_criterion,
             "num_queries": cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES,
             "object_mask_threshold": cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD,
             "overlap_threshold": cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD,
@@ -276,8 +295,19 @@ class VideoMaskFormer_frame(nn.Module):
                     losses.pop(k)
 
             appearance_features = [f.detach() for f in features.values()][:3]
-            appearance_loss = self.appearance_decoder(outputs['pred_embds'], appearance_features, outputs['pred_masks'], indices, targets)
-            losses.update(appearance_loss)
+            appearance_outputs = self.appearance_decoder(outputs['pred_embds'], appearance_features, outputs['pred_masks'], indices, targets)
+            appearance_losses = self.appearance_criterion(appearance_outputs, targets, indices)
+
+            for k in list(appearance_losses.keys()):
+                if k in self.appearance_criterion.weight_dict:
+                    appearance_losses[k] *= self.appearance_criterion.weight_dict[k]
+                    if k in  self.criterion.weight_dict:
+                        losses[f'{k}_app'] = appearance_losses[k]
+                        appearance_losses.pop(k)
+                else:
+                    # remove this loss if not specified in `weight_dict`
+                    appearance_losses.pop(k)
+            losses.update(appearance_losses)
                     
             return losses
         else:
