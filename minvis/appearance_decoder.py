@@ -29,120 +29,66 @@ class AppearanceDecoder(nn.Module):
         # only use res2 feature
         self.num_feature_levels = len(in_channels)
         self.input_proj = nn.ModuleList()
-        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         for l in range(self.num_feature_levels):
             self.input_proj.append(nn.Sequential(
                 Conv2d(in_channels[l], hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
             ))
         self.appearance_embd = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
 
-        self.criterion = nn.CosineSimilarity(dim=-1)
+        self.reid_embd = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
 
         # appearance decoder
         self.num_heads = nheads
-        self.num_layers = appearance_layers
-        self.appearance_self_attention_layers = nn.ModuleList()
-        self.appearance_cross_attention_layers = nn.ModuleList()
-        self.appearance_ffn_layers = nn.ModuleList()
-
-        for _ in range(self.num_layers):
-            self.appearance_self_attention_layers.append(
-                SelfAttentionLayer(
-                    d_model=hidden_dim,
-                    nhead=nheads,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
-                )
-            )
-
-            self.appearance_cross_attention_layers.append(
-                CrossAttentionLayer(
-                    d_model=hidden_dim,
-                    nhead=nheads,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
-                )
-            )
-
-            self.appearance_ffn_layers.append(
-                FFNLayer(
-                    d_model=hidden_dim,
-                    dim_feedforward=dim_feedforward,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
-                )
-            )
 
     def forward(self, pred_embds, appearance_features, output_masks, indices=None, targets=None):
         assert len(appearance_features) == self.num_feature_levels
-        src, pos = [], []
-        attn_mask = []
 
         B, T, Q, C = pred_embds.shape
-        output_masks = (output_masks.transpose(1, 2).flatten(0, 1).detach().sigmoid() > 0.5).float()
+        output_masks = output_masks.squeeze(2).detach()
 
         for i in range(self.num_feature_levels):
-            pos.append(self.pe_layer(appearance_features[i], None).flatten(2))
-            src.append(self.input_proj[i](appearance_features[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+            resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:], mode='bilinear', align_corners=False).flatten(2).softmax(-1)
+            proj_features = self.input_proj[i](appearance_features[i]).flatten(2)
+            appearance_queries = torch.einsum('bqd,bcd->bqc', resize_mask, proj_features)
 
-            resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:])
-            attn_resize_mask = (resize_mask.flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0,1) == 0).bool()
-            attn_resize_mask[torch.where(attn_resize_mask[:, :].sum(-1) == attn_resize_mask.shape[-1])] = False
-            attn_mask.append(attn_resize_mask)
+        appearance_queries = self.appearance_embd(appearance_queries).reshape(B, T, Q, C)
 
-            # flatten NxCxHxW to HWxNxC
-            pos[-1] = pos[-1].permute(2, 0, 1)
-            src[-1] = src[-1].permute(2, 0, 1)
-
-        output = pred_embds.flatten(0, 1).transpose(0, 1)
-
-
-        for i in range(self.num_layers):
-            level_index = i % self.num_feature_levels
-            # attention: cross-attention first
-            output = self.appearance_cross_attention_layers[i](
-                output, src[level_index],
-                memory_mask=attn_mask[level_index],
-                memory_key_padding_mask=None,
-                pos=pos[level_index],
-            )
-            output = self.appearance_self_attention_layers[i](
-                output, tgt_mask=None,
-                tgt_key_padding_mask=None,
-            )
-            output = self.appearance_ffn_layers[i](
-                output
-            )
-
-        appearance_queries = output.reshape(Q, B, T, C).permute(1, 2, 0, 3)
-
-        appearance_queries = self.appearance_embd(appearance_queries)
+        reid_queries = self.reid_embd(pred_embds)
 
         if self.training:
-            sample_queries = appearance_queries.unbind(1)
+            sample_appearance_queries = appearance_queries.unbind(1)
+            sample_reid_queries = reid_queries.unbind(1)
             valid_indices = [t['ids'].squeeze(1) != -1 for t in targets]
 
             losses = dict()
 
             for t in range(1, T):
-                ref_queries = sample_queries[t-1]
-                key_queries = sample_queries[t]
                 sample_valid_indices = [(v1 & v2).cpu() for v1, v2 in zip(valid_indices[t-1::T], valid_indices[t::T])]
                 ref_indices = [src[tgt.argsort()] for src, tgt in indices[t-1::T]]
                 key_indices = [src[tgt.argsort()] for src, tgt in indices[t::T]]
-                
 
+                ref_queries = sample_reid_queries[t-1]
+                key_queries = sample_reid_queries[t]
+                
                 dists, cos_dists, labels = self.match(key_queries, ref_queries, ref_indices, key_indices, sample_valid_indices)
                 if len(dists) == 0:
-                    loss = {f'loss_reid_{t}': key_queries.sum()*0., f'loss_aux_cos_{t}': ref_queries.sum()*0.}
+                    loss = {f'loss_reid_{t}': key_queries.sum()*0., f'loss_aux_reid_{t}': ref_queries.sum()*0.}
                 else:
                     loss = self.loss(dists, cos_dists, labels, t)
                 losses.update(loss)
-            return losses
-            
-        track_queries = appearance_queries
 
-        return track_queries
+                ref_queries = sample_appearance_queries[t-1]
+                key_queries = sample_appearance_queries[t]
+                
+                dists, cos_dists, labels = self.match(key_queries, ref_queries, ref_indices, key_indices, sample_valid_indices)
+                if len(dists) == 0:
+                    loss = {f'loss_aux_cos_{t}': ref_queries.sum()*0.}
+                else:
+                    loss = self.loss(dists, cos_dists, labels, t, reid=False)
+                losses.update(loss)
+            return losses
+
+        return reid_queries, appearance_queries
     
     def match(self, key, ref, ref_indices, key_indices, valid_indices):
         dists, cos_dists, labels = [], [], []
@@ -159,7 +105,7 @@ class AppearanceDecoder(nn.Module):
 
         return dists, cos_dists, labels
     
-    def loss(self, dists, cos_dists, labels, t):
+    def loss(self, dists, cos_dists, labels, t, reid=True):
         
         loss_reid = 0.0
         loss_aux_cos = 0.0
@@ -173,17 +119,23 @@ class AppearanceDecoder(nn.Module):
             dist_pos[neg_inds] = dist_pos[neg_inds] + float('inf')
             dist_neg[pos_inds] = dist_neg[pos_inds] - float('inf')
 
-            _pos_expand = torch.repeat_interleave(dist_pos, dist.shape[1], dim=1)
-            _neg_expand = dist_neg.repeat(1, dist.shape[1])
+            if reid:
+                _pos_expand = torch.repeat_interleave(dist_pos, dist.shape[1], dim=1)
+                _neg_expand = dist_neg.repeat(1, dist.shape[1])
 
-            x = F.pad((_neg_expand - _pos_expand), (0,1), value=0)
-            loss = torch.logsumexp(x, dim=1)# * (dist.shape[0] > 0).float()
-            loss_reid += loss.sum()
+                x = F.pad((_neg_expand - _pos_expand), (0,1), value=0)
+                loss = torch.logsumexp(x, dim=1)# * (dist.shape[0] > 0).float()
+                loss_reid += loss.sum()
 
             loss = torch.abs(cos_dist - label.float())**2
             loss_aux_cos += loss.mean(-1).sum()
 
-        return {f'loss_reid_{t}': loss_reid / num_instances * 2, f'loss_aux_cos_{t}': loss_aux_cos / num_instances * 3}
+        if reid:
+            losses = {f'loss_reid_{t}': loss_reid / num_instances * 2, f'loss_aux_reid_{t}': loss_aux_cos / num_instances * 3}
+        else:
+            losses = {f'loss_aux_cos_{t}': loss_aux_cos / num_instances * 3}
+
+        return losses
 
     def _get_permutation_idx(self, indices, valid_indices):
         # permute targets following indices
