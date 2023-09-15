@@ -33,13 +33,14 @@ class AppearanceDecoder(nn.Module):
                 Conv2d(in_channels[l], hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
                 Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
             ))
+        self.mask_feature_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim))
         self.appearance_embd = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
         self.appearance_norm = nn.LayerNorm(hidden_dim)
 
         self.track_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
-        # self.mask_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        self.mask_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
 
         # appearance decoder
         self.num_heads = nheads
@@ -66,7 +67,7 @@ class AppearanceDecoder(nn.Module):
                 )
             )
 
-    def forward(self, pred_embds, appearance_features, output_masks, indices=None, targets=None):
+    def forward(self, pred_embds, appearance_features, output_masks, mask_features=None, indices=None, targets=None):
         B, T, Q, C = pred_embds.shape
         output_masks = output_masks.transpose(1, 2).flatten(0, 1).detach()
         output_masks = (output_masks.sigmoid() > 0.5).float()
@@ -79,6 +80,7 @@ class AppearanceDecoder(nn.Module):
 
         output = appearance_queries.transpose(0, 1)
 
+        mask_features = self.mask_feature_proj(mask_features)
 
         for i in range(self.num_layers):
             # attention: cross-attention first
@@ -104,8 +106,12 @@ class AppearanceDecoder(nn.Module):
             outputs_class = self.class_embed(torch.stack([key_queries, ref_queries], dim=1))
             contrastive_items = self.match(key_reid_embds, ref_reid_embds, indices, valid_indices)
 
+            outputs_mask_embed = self.mask_embed(torch.stack([key_queries, ref_queries], dim=1)).flatten(0, 1)
+            outputs_mask = torch.einsum('bqc,bchw->bqhw', outputs_mask_embed, mask_features)
+
             out = {
                 'pred_logits': outputs_class.flatten(0, 1),
+                'pred_masks': outputs_mask,
                 'contrastive_items': contrastive_items,
             }
 
