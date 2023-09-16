@@ -80,8 +80,6 @@ class AppearanceDecoder(nn.Module):
 
         output = appearance_queries.transpose(0, 1)
 
-        mask_features = self.mask_feature_proj(mask_features)
-
         for i in range(self.num_layers):
             # attention: cross-attention first
             output = self.appearance_self_attention_layers[i](
@@ -106,12 +104,14 @@ class AppearanceDecoder(nn.Module):
             outputs_class = self.class_embed(torch.stack([key_queries, ref_queries], dim=1))
             contrastive_items = self.match(key_reid_embds, ref_reid_embds, indices, valid_indices)
 
+            mask_features = self.mask_feature_proj(mask_features)
+
             outputs_mask_embed = self.mask_embed(torch.stack([key_queries, ref_queries], dim=1)).flatten(0, 1)
             outputs_mask = torch.einsum('bqc,bchw->bqhw', outputs_mask_embed, mask_features)
 
             out = {
                 'pred_logits': outputs_class.flatten(0, 1),
-                'pred_masks': outputs_mask,
+                'pred_masks': outputs_mask.unsqueeze(2),
                 'contrastive_items': contrastive_items,
             }
 

@@ -48,7 +48,7 @@ DATASETS:
   TRAIN: ("coco2ytvis2019_train", "ytvis_2019_train")
   TEST: ("ytvis_2019_val",)
 SOLVER:
-  IMS_PER_BATCH: 32
+  IMS_PER_BATCH: 16
   CHECKPOINT_PERIOD: 1000
 INPUT:
   SAMPLING_FRAME_NUM: 2

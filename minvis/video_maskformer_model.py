@@ -187,8 +187,8 @@ class VideoMaskFormer_frame(nn.Module):
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
         )
 
-        appearance_weight_dict = {"loss_ce": class_weight, "loss_reid": 2.0, "loss_aux_cos": 3.0}
-        appearance_losses = ["labels", "reid"]
+        appearance_weight_dict = {"loss_ce": class_weight,  "loss_mask": mask_weight, "loss_dice": dice_weight, "loss_reid": 2.0, "loss_aux_cos": 3.0}
+        appearance_losses = ["labels", "masks", "reid"]
 
         appearance_decoder = AppearanceDecoder(
             in_channels=[512],
@@ -225,7 +225,7 @@ class VideoMaskFormer_frame(nn.Module):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            "freeze_detector": True,
+            "freeze_detector": False,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,
@@ -296,7 +296,7 @@ class VideoMaskFormer_frame(nn.Module):
 
             appearance_features = [f.detach() for f in features.values()][1:2]
             appearance_outputs = self.appearance_decoder(
-                outputs['pred_embds'], appearance_features, outputs['pred_masks'], outputs['mask__features'], indices, targets
+                outputs['pred_embds'], appearance_features, outputs['pred_masks'], outputs['mask_features'], indices, targets
                 )
             appearance_losses = self.appearance_criterion(appearance_outputs, targets, indices)
 
@@ -403,8 +403,8 @@ class VideoMaskFormer_frame(nn.Module):
         out_appearance_embds.append(appearance_embds[0])
 
         for i in range(1, len(pred_logits)):
-            # indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
-            indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
+            indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
+            # indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
