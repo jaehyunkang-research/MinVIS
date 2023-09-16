@@ -225,7 +225,7 @@ class VideoMaskFormer_frame(nn.Module):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            "freeze_detector": False,
+            "freeze_detector": True,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,
@@ -403,8 +403,8 @@ class VideoMaskFormer_frame(nn.Module):
         out_appearance_embds.append(appearance_embds[0])
 
         for i in range(1, len(pred_logits)):
-            indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
-            # indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
+            # indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
+            indices = self.match_from_embds(out_appearance_embds[-1], appearance_embds[i])
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])

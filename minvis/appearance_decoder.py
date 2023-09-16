@@ -26,15 +26,18 @@ class AppearanceDecoder(nn.Module):
     ):
         super().__init__()
         # only use res2 feature
+        self.pe_layer = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
+
+        # only use res2 feature
         self.num_feature_levels = len(in_channels)
         self.input_proj = nn.ModuleList()
+        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         for l in range(self.num_feature_levels):
             self.input_proj.append(nn.Sequential(
                 Conv2d(in_channels[l], hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
                 Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim)),
             ))
         self.mask_feature_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=1, norm=get_norm("GN", hidden_dim))
-        self.appearance_embd = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
         self.appearance_norm = nn.LayerNorm(hidden_dim)
 
         self.track_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
@@ -46,11 +49,21 @@ class AppearanceDecoder(nn.Module):
         self.num_heads = nheads
         self.num_layers = appearance_layers
         self.appearance_self_attention_layers = nn.ModuleList()
+        self.appearance_cross_attention_layers = nn.ModuleList()
         self.appearance_ffn_layers = nn.ModuleList()
 
         for _ in range(self.num_layers):
             self.appearance_self_attention_layers.append(
                 SelfAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.appearance_cross_attention_layers.append(
+                CrossAttentionLayer(
                     d_model=hidden_dim,
                     nhead=nheads,
                     dropout=0.0,
@@ -68,19 +81,34 @@ class AppearanceDecoder(nn.Module):
             )
 
     def forward(self, pred_embds, appearance_features, output_masks, mask_features=None, indices=None, targets=None):
+        src, pos = [], []
+        attn_mask = []
+
         B, T, Q, C = pred_embds.shape
         output_masks = output_masks.transpose(1, 2).flatten(0, 1).detach()
-        output_masks = (output_masks.sigmoid() > 0.5).float()
 
         for i in range(self.num_feature_levels):
-            proj_features = self.input_proj[i](appearance_features[i]).flatten(2)
-            appearance_queries = torch.einsum('bqc,bcd->bqd', pred_embds.flatten(0, 1), proj_features).softmax(-1)
-            appearance_queries = torch.einsum('bqd,bcd->bqc', appearance_queries, proj_features)
-            appearance_queries = self.appearance_embd(appearance_queries)
+            pos.append(self.pe_layer(appearance_features[i], None).flatten(2))
+            src.append(self.input_proj[i](appearance_features[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
 
-        output = appearance_queries.transpose(0, 1)
+            resize_mask = F.interpolate(output_masks, size=appearance_features[i].shape[-2:])
+            attn_resize_mask = (resize_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0,1) < 0.5).bool()
+            attn_resize_mask[torch.where(attn_resize_mask[:, :, None].sum(-1) == attn_resize_mask.shape[-1])] = False
+            attn_mask.append(attn_resize_mask)
+
+            # flatten NxCxHxW to HWxNxC
+            pos[-1] = pos[-1].permute(2, 0, 1)
+            src[-1] = src[-1].permute(2, 0, 1)
+
+        output = pred_embds.flatten(0, 1).transpose(0, 1)
 
         for i in range(self.num_layers):
+            output = self.appearance_cross_attention_layers[i](
+                output, src[0],
+                memory_mask=attn_mask[0],
+                memory_key_padding_mask=None,
+                pos=pos[0],
+            )
             # attention: cross-attention first
             output = self.appearance_self_attention_layers[i](
                 output, tgt_mask=None,
