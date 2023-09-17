@@ -82,7 +82,7 @@ class AppearanceDecoder(nn.Module):
                 
                 dists, cos_dists, labels = self.match(key_queries, ref_queries, ref_indices, key_indices, sample_valid_indices)
                 if len(dists) == 0:
-                    loss = {f'loss_aux_cos_{t}': ref_queries.sum()*0.}
+                    loss = {f'loss_app_reid_{t}': key_queries.sum()*0., f'loss_aux_cos_{t}': ref_queries.sum()*0.}
                 else:
                     loss = self.loss(dists, cos_dists, labels, t, reid=False)
                 losses.update(loss)
@@ -119,13 +119,12 @@ class AppearanceDecoder(nn.Module):
             dist_pos[neg_inds] = dist_pos[neg_inds] + float('inf')
             dist_neg[pos_inds] = dist_neg[pos_inds] - float('inf')
 
-            if reid:
-                _pos_expand = torch.repeat_interleave(dist_pos, dist.shape[1], dim=1)
-                _neg_expand = dist_neg.repeat(1, dist.shape[1])
+            _pos_expand = torch.repeat_interleave(dist_pos, dist.shape[1], dim=1)
+            _neg_expand = dist_neg.repeat(1, dist.shape[1])
 
-                x = F.pad((_neg_expand - _pos_expand), (0,1), value=0)
-                loss = torch.logsumexp(x, dim=1)# * (dist.shape[0] > 0).float()
-                loss_reid += loss.sum()
+            x = F.pad((_neg_expand - _pos_expand), (0,1), value=0)
+            loss = torch.logsumexp(x, dim=1)# * (dist.shape[0] > 0).float()
+            loss_reid += loss.sum()
 
             loss = torch.abs(cos_dist - label.float())**2
             loss_aux_cos += loss.mean(-1).sum()
@@ -133,7 +132,7 @@ class AppearanceDecoder(nn.Module):
         if reid:
             losses = {f'loss_reid_{t}': loss_reid / num_instances * 2, f'loss_aux_reid_{t}': loss_aux_cos / num_instances * 3}
         else:
-            losses = {f'loss_aux_cos_{t}': loss_aux_cos / num_instances * 3}
+            losses = {f'loss_app_reid_{t}': loss_reid / num_instances * 2, f'loss_aux_cos_{t}': loss_aux_cos / num_instances * 3}
 
         return losses
 
