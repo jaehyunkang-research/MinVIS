@@ -242,7 +242,7 @@ class VideoMaskFormer_frame(nn.Module):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            "freeze_detector": False,
+            "freeze_detector": True,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE,
@@ -311,14 +311,14 @@ class VideoMaskFormer_frame(nn.Module):
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
 
-            appearance_features = [f.detach() for f in features.values()][3:4]
+            appearance_features = [f.detach() for f in features.values()][1:2]
             appearance_loss = self.appearance_decoder(outputs['pred_embds'], appearance_features, outputs['pred_masks'], indices, targets)
             losses.update(appearance_loss)
                     
             return losses
         else:
             if not self.window_inference:
-                appearance_features = [f.detach() for f in features.values()][3:4]
+                appearance_features = [f.detach() for f in features.values()][1:]
                 reid_embds, appearance_embds = self.appearance_decoder(outputs['pred_embds'], appearance_features, einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w'))
             outputs = self.post_processing(outputs, reid_embds, appearance_embds)
 
@@ -413,19 +413,19 @@ class VideoMaskFormer_frame(nn.Module):
         out_appearance_embds = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
-        self.memory_bank.update(pred_embds[0])
+        self.memory_bank.update(reid_embds[0])
         self.appearance_memory_bank.update(appearance_embds[0])
 
         for i in range(1, len(pred_logits)):
             # indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
             prevs = (self.memory_bank.get(), self.appearance_memory_bank.get())
-            curs = (pred_embds[i], appearance_embds[i])
+            curs = (reid_embds[i], appearance_embds[i])
 
             indices = self.match_from_embds(prevs, curs)
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
-            self.memory_bank.update(pred_embds[i][indices, :])
+            self.memory_bank.update(reid_embds[i][indices, :])
             self.appearance_memory_bank.update(appearance_embds[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)

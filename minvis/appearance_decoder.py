@@ -41,8 +41,6 @@ class AppearanceDecoder(nn.Module):
         self.num_heads = nheads
 
     def forward(self, pred_embds, appearance_features, output_masks, indices=None, targets=None):
-        assert len(appearance_features) == self.num_feature_levels
-
         B, T, Q, C = pred_embds.shape
         output_masks = output_masks.squeeze(2).detach()
 
@@ -94,10 +92,10 @@ class AppearanceDecoder(nn.Module):
         dists, cos_dists, labels = [], [], []
         for key_embed, ref_embed, key_idx, ref_idx, valid_idx in zip(key, ref, key_indices, ref_indices, valid_indices):
             anchor = key_embed[key_idx[valid_idx]] 
-            dist = torch.einsum('ac, kc -> ak', anchor, ref_embed)
-            cos_dist = torch.einsum('ac, kc -> ak', F.normalize(anchor, dim=-1), F.normalize(ref_embed, dim=-1))
-            label = ref_idx[valid_idx].to(anchor.device)
-            label_ = torch.zeros_like(dist).scatter_(1, label[:, None], 1)
+            target = ref_embed[ref_idx[valid_idx]]
+            dist = torch.einsum('ac, kc -> ak', anchor, target)
+            cos_dist = torch.einsum('ac, kc -> ak', F.normalize(anchor, dim=-1), F.normalize(target, dim=-1))
+            label_ = torch.eye(len(dist), device=dist.device)
 
             dists.append(dist)
             cos_dists.append(cos_dist)
