@@ -172,8 +172,8 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.appearance_decoder = appearance_decoder
 
-        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
-        self.appearance_memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
+        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=10, tau=0.5)
+        self.appearance_memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=10, tau=0.5)
         # self.appearance_memory_bank = AppearanceMemoryBank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
 
     @classmethod
@@ -413,19 +413,19 @@ class VideoMaskFormer_frame(nn.Module):
         out_appearance_embds = []
         out_logits.append(pred_logits[0])
         out_masks.append(pred_masks[0])
-        self.memory_bank.update(reid_embds[0])
+        self.memory_bank.update(pred_embds[0])
         self.appearance_memory_bank.update(appearance_embds[0])
 
         for i in range(1, len(pred_logits)):
             # indices = self.match_from_embds(self.memory_bank.get(), pred_embds[i])
             prevs = (self.memory_bank.get(), self.appearance_memory_bank.get())
-            curs = (reid_embds[i], appearance_embds[i])
+            curs = (pred_embds[i], appearance_embds[i])
 
             indices = self.match_from_embds(prevs, curs)
 
             out_logits.append(pred_logits[i][indices, :])
             out_masks.append(pred_masks[i][indices, :, :])
-            self.memory_bank.update(reid_embds[i][indices, :])
+            self.memory_bank.update(pred_embds[i][indices, :])
             self.appearance_memory_bank.update(appearance_embds[i][indices, :])
 
         out_logits = sum(out_logits)/len(out_logits)
