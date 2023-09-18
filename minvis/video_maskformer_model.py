@@ -172,8 +172,8 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.appearance_decoder = appearance_decoder
 
-        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=10, tau=0.5)
-        self.appearance_memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=10, tau=0.5)
+        self.memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
+        self.appearance_memory_bank = Memorybank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
         # self.appearance_memory_bank = AppearanceMemoryBank(num_queries, hidden_dim=256, bank_size=3, tau=0.5)
 
     @classmethod
