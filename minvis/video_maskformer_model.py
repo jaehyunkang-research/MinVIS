@@ -382,7 +382,8 @@ class VideoMaskFormer_frame(nn.Module):
 
         cost_appearance = cos_sim
 
-        C = 1.0 * (cost_embd)# + cost_appearance.softmax(1))
+        # C = 1.0 * (cost_embd)# + cost_appearance.softmax(1))
+        C = 1.0 * (cost_embd) + cost_appearance
         C = C.cpu()
 
         indices = linear_sum_assignment(C.transpose(0, 1), maximize=True)  # target x current
